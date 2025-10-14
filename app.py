@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Snab Notify", version="1.0.0")
 
-BOT_TOKEN = os.getenv("8436347589:AAGAcEgto8ebT4sd6_4gBy5EJ4NL9hKa_Rg", "")
+BOT_TOKEN = os.getenv("8268920782:AAFcxeoa7ny8cKfMzuP84r2iVe22Q7aHhyE", "")
 CHAT_ID = os.getenv("-1003141855190", "")            # -1003141855190
 WEBHOOK_SECRET = os.getenv("sahar2025secure_longtoken", "")
 
