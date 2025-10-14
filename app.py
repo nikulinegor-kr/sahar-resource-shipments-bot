@@ -1,70 +1,86 @@
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
+# app.py
 import os
+import html
 import requests
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
-app = FastAPI()
+app = FastAPI(title="Snab Notify", version="1.0.0")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID", "-1003141855190")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# --- ENV ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")  # e.g. -1003141855190
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# --- MODELS ---
+class Responsible(BaseModel):
+    name: Optional[str] = None
+    username: Optional[str] = None  # без @
+    user_id: Optional[int] = None
 
 class Item(BaseModel):
     name: str
-    qty: int
-    unit: str
+    qty: Optional[float] = None
+    unit: Optional[str] = None
 
-class Responsible(BaseModel):
-    name: str
-    username: str | None = None
+class NotifyPayload(BaseModel):
+    order_id: str = Field(..., description="Номер заявки/заказа")
+    recipient: str = Field(..., description="Получатель (компания)")
+    city: Optional[str] = None
+    phone: Optional[str] = None
+    ship_date: Optional[str] = None
+    status: Optional[str] = None
+    comment: Optional[str] = None
+    responsible: Optional[Responsible] = None
+    items: List[Item] = []
 
-class Shipment(BaseModel):
-    order_id: str
-    recipient: str
-    city: str
-    phone: str
-    items: list[Item]
-    responsible: Responsible
-    ship_date: str
-    status: str
-    comment: str | None = None
+# --- HELPERS ---
+def tg_send_html(text: str) -> bool:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    r = requests.post(url, json=data, timeout=15)
+    return r.ok
 
+def render_message(p: NotifyPayload) -> str:
+    # безопасим текст
+    esc = lambda s: html.escape(s or "")
+    parts = []
+    if p.order_id: parts.append(f"<b>Заявка:</b> {esc(p.order_id)}")
+    if p.status:   parts.append(f"<b>Статус:</b> {esc(p.status)}")
+    if p.ship_date: parts.append(f"<b>Дата отгрузки:</b> {esc(p.ship_date)}")
 
+    # Комментарий (в нём ты сейчас дублируешь: Заявка, Статус, ТК, №ТТН, даты)
+    if p.comment:
+        parts.append(f"<b>Комментарий:</b> {esc(p.comment)}")
+
+    # Ответственный
+    if p.responsible:
+        r = p.responsible
+        if r.username:
+            parts.append(f"<b>Ответственный:</b> @{esc(r.username)}")
+        elif r.user_id:
+            parts.append(f"<b>Ответственный:</b> tg://user?id={r.user_id}")
+        elif r.name:
+            parts.append(f"<b>Ответственный:</b> {esc(r.name)}")
+
+    return "\n".join(parts)
+
+# --- ROUTES ---
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
 @app.post("/notify")
-def notify(request: Request, shipment: Shipment):
-    auth = request.headers.get("Authorization")
-    if auth != f"Bearer {WEBHOOK_SECRET}":
-        raise HTTPException(status_code=403, detail="Forbidden")
+def notify(payload: NotifyPayload, authorization: str = Header(default="")):
+    if WEBHOOK_SECRET and authorization != f"Bearer {WEBHOOK_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    message = (
-        f"🚚 <b>Отгрузка ТМЦ</b>\n\n"
-        f"<b>Заказ:</b> {shipment.order_id}\n"
-        f"<b>Получатель:</b> {shipment.recipient}\n"
-        f"<b>Город:</b> {shipment.city}\n"
-        f"<b>Телефон:</b> {shipment.phone}\n"
-        f"<b>Дата отгрузки:</b> {shipment.ship_date}\n"
-        f"<b>Статус:</b> {shipment.status}\n\n"
-        f"<b>ТМЦ:</b>\n"
-    )
-    for item in shipment.items:
-        message += f"• {item.name} — {item.qty} {item.unit}\n"
+    if not BOT_TOKEN or not CHAT_ID:
+        raise HTTPException(status_code=500, detail="Telegram not configured")
 
-    if shipment.comment:
-        message += f"\n📝 <b>Комментарий:</b> {shipment.comment}\n"
-
-    if shipment.responsible.username:
-        message += f"\n👤 Ответственный: @{shipment.responsible.username}"
-    else:
-        message += f"\n👤 Ответственный: {shipment.responsible.name}"
-
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    )
-
-    return {"ok": True, "sent_to": shipment.recipient}
+    msg = render_message(payload)
+    ok = tg_send_html(msg)
+    if not ok:
+        raise HTTPException(status_code=502, detail="Telegram send failed")
+    return {"ok": True}
