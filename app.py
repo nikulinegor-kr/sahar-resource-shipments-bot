@@ -4,7 +4,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Snab Notify", version="1.1.0")
+app = FastAPI(title="Snab Notify", version="1.2.0")
 
 # === КОНФИГ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8436347589:AAGAcEgto8ebT4sd6_4gBy5EJ4NL9hKa_Rg")
@@ -12,11 +12,6 @@ CHAT_ID = os.getenv("CHAT_ID", "-1003141855190")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "sahar2025secure_longtoken")
 
 # === МОДЕЛИ ===
-class Responsible(BaseModel):
-    name: Optional[str] = None
-    username: Optional[str] = None
-    user_id: Optional[int] = None
-
 class Item(BaseModel):
     name: str
     qty: Optional[float] = None
@@ -70,11 +65,6 @@ def render_message(p: NotifyPayload) -> str:
         parts.append(f"📄 <b>№ ТТН:</b> {esc(p.ttn)}")
     if p.applicant:
         parts.append(f"👤 <b>Заявитель:</b> {esc(p.applicant)}")
-
-    # Добавляем дату и время отправки
-    ts = datetime.now().strftime("%d.%m.%Y, %H:%M")
-    parts.append("")
-    parts.append(f"🕒 <i>Отправлено: {ts}</i>")
 
     return "\n".join(parts)
 
