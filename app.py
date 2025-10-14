@@ -5,10 +5,10 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Snab Notify", version="1.0.0")
-
-BOT_TOKEN = os.getenv("8436347589:AAGAcEgto8ebT4sd6_4gBy5EJ4NL9hKa_Rg", "")
-CHAT_ID = os.getenv("-1003141855190", "")            # -1003141855190
-WEBHOOK_SECRET = os.getenv("sahar2025secure_longtoken", "")
+# ПРАВИЛЬНО: читаем ИМЕНА env-переменных
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 class Responsible(BaseModel):
     name: Optional[str] = None
