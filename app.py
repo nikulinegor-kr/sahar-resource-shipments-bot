@@ -51,15 +51,23 @@ def tg_send_html(text: str):
 def render_message(p: NotifyPayload) -> str:
     esc = lambda s: html.escape(s or "")
     parts = []
-    if p.order_id:   parts.append(f"<b>Заявка:</b> {esc(p.order_id)}")
-    if p.status:     parts.append(f"<b>Статус:</b> {esc(p.status)}")
-    if p.ship_date:  parts.append(f"<b>Дата отгрузки:</b> {esc(p.ship_date)}")
-    if p.comment:    parts.append(f"<b>Комментарий:</b> {esc(p.comment)}")
+
+    if p.order_id:   parts.append(f"📦 <b>Заявка:</b> {esc(p.order_id)}")
+    if p.status:     parts.append(f"🚚 <b>Статус:</b> {esc(p.status)}")
+    if p.ship_date:  parts.append(f"📅 <b>Дата отгрузки:</b> {esc(p.ship_date)}")
+    if p.comment:    parts.append(f"🗒 <b>Комментарий:</b> {esc(p.comment)}")
+
+    # Можно разбить комментарий визуально от основных полей
+    if p.arrival_date: parts.append(f"📍 <b>Дата прибытия:</b> {esc(p.arrival_date)}")
     if p.responsible:
         r = p.responsible
-        if r.username: parts.append(f"<b>Ответственный:</b> @{esc(r.username)}")
-        elif r.user_id: parts.append(f"<b>Ответственный:</b> tg://user?id={r.user_id}")
-        elif r.name:   parts.append(f"<b>Ответственный:</b> {esc(r.name)}")
+        if r.username:
+            parts.append(f"👤 <b>Ответственный:</b> @{esc(r.username)}")
+        elif r.user_id:
+            parts.append(f"👤 <b>Ответственный:</b> tg://user?id={r.user_id}")
+        elif r.name:
+            parts.append(f"👤 <b>Ответственный:</b> {esc(r.name)}")
+
     return "\n".join(parts)
 
 @app.get("/health")
