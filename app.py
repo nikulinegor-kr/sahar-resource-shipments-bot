@@ -87,3 +87,34 @@ def notify(payload: NotifyPayload, authorization: str = Header(default="")):
         raise HTTPException(status_code=502, detail=f"Telegram error {sc}: {txt}")
 
     return {"ok": True, "sent": True, "status_code": sc}
+from fastapi import Request
+
+# === Обработка команд Telegram ===
+@app.post(f"/bot/{BOT_TOKEN}")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    print("Telegram update:", data)
+
+    message = data.get("message", {})
+    text = message.get("text", "")
+    chat_id = message["chat"]["id"]
+
+    if text.startswith("/start"):
+        send_text(chat_id, "👋 Привет! Я бот уведомлений для СахаРесурс.")
+    elif text.startswith("/help"):
+        send_text(chat_id, "📖 Доступные команды:\n/notify_test – отправить тестовое уведомление")
+    elif text.startswith("/notify_test"):
+        send_text(chat_id, "✅ Тестовое уведомление отправлено успешно.")
+    else:
+        send_text(chat_id, "🤖 Команда не распознана. Напиши /help.")
+
+    return {"ok": True}
+
+
+def send_text(chat_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    })
