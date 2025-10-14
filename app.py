@@ -70,7 +70,13 @@ def health():
 def notify(payload: NotifyPayload, authorization: str = Header(default="")):
     if WEBHOOK_SECRET and authorization != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     msg = render_message(payload)
-    if not tg_send_html(msg):
-        raise HTTPException(status_code=502, detail="Telegram send failed")
+    ok, sc, txt = tg_send_html(msg)
+
+    if not ok:
+        # чтобы видеть в логах, почему именно Telegram отказал
+        print(f"Telegram error {sc}: {txt}")
+        raise HTTPException(status_code=502, detail=f"Telegram error {sc}: {txt}")
+
     return {"ok": True}
