@@ -31,13 +31,23 @@ class NotifyPayload(BaseModel):
     responsible: Optional[Responsible] = None
     items: List[Item] = []
 
-def tg_send_html(text: str) -> bool:
-    if not BOT_TOKEN or not CHAT_ID:
-        return False
+def tg_send_html(text: str):
+    import requests
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-    return r.ok
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=data, timeout=15)
 
+    # Важно: логируем ответ Telegram
+    print("=== Telegram API response ===")
+    print("Status:", r.status_code)
+    print("Body:", r.text)
+
+    return r.ok, r.status_code, r.text
 def render_message(p: NotifyPayload) -> str:
     esc = lambda s: html.escape(s or "")
     parts = []
