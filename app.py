@@ -1,25 +1,20 @@
-# app.py
-import os
-import html
+import os, html, requests
 from datetime import datetime
 from typing import Optional, List
-
-import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Snab Notify", version="1.3.0")
+app = FastAPI(title="Snab Notify", version="1.1.0")
 
-# === ENV (задай в Koyeb → Settings → Environment variables) ===
-# BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+# === КОНФИГ ===
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8436347589:AAGAcEgto8ebT4sd6_4gBy5EJ4NL9hKa_Rg")
+CHAT_ID = os.getenv("CHAT_ID", "-1003141855190")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "sahar2025secure_longtoken")
 
-# === MODELS ===
+# === МОДЕЛИ ===
 class Responsible(BaseModel):
     name: Optional[str] = None
-    username: Optional[str] = None   # без @
+    username: Optional[str] = None
     user_id: Optional[int] = None
 
 class Item(BaseModel):
@@ -28,95 +23,65 @@ class Item(BaseModel):
     unit: Optional[str] = None
 
 class NotifyPayload(BaseModel):
-    # обязательные
-    order_id: str
-    recipient: str
-
-    # опциональные
-    priority: Optional[str] = None             # ← НОВОЕ: Приоритет
-    city: Optional[str] = None
-    phone: Optional[str] = None
-    ship_date: Optional[str] = None            # YYYY-MM-DD
-    arrival_date: Optional[str] = None         # YYYY-MM-DD
+    order_id: Optional[str] = Field(None, description="Номер заявки")
+    priority: Optional[str] = None
     status: Optional[str] = None
-    carrier: Optional[str] = None              # ТК
-    ttn: Optional[str] = None                  # № ТТН
-    comment: Optional[str] = None
-    responsible: Optional[Responsible] = None
-    items: List[Item] = Field(default_factory=list)
+    ship_date: Optional[str] = None
+    arrival: Optional[str] = None
+    carrier: Optional[str] = None
+    ttn: Optional[str] = None
+    applicant: Optional[str] = None
+    recipient: Optional[str] = None
+    items: List[Item] = []
 
-# === HELPERS ===
-RU_MONTHS = [
-    "января","февраля","марта","апреля","мая","июня",
-    "июля","августа","сентября","октября","ноября","декабря"
-]
-
-def fmt_pretty_date(date_str: Optional[str]) -> str:
-    """YYYY-MM-DD → '13 октября 2025'. Если не распарсилось — вернём как есть."""
-    if not date_str:
-        return ""
-    try:
-        d = datetime.strptime(date_str, "%Y-%m-%d")
-        return f"{d.day} {RU_MONTHS[d.month-1]} {d.year}"
-    except Exception:
-        return date_str
-
-def tg_send_html(text: str, chat_id: Optional[str] = None):
-    """Отправка сообщения в Telegram (HTML)."""
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("BOT_TOKEN/CHAT_ID не заданы в переменных окружения")
-
+# === ОТПРАВКА В TELEGRAM ===
+def tg_send_html(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {
-        "chat_id": chat_id or CHAT_ID,
+        "chat_id": CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     r = requests.post(url, json=data, timeout=15)
-
-    # лог для диагностики
     print("=== Telegram API response ===")
     print("Status:", r.status_code)
     print("Body:", r.text)
-
     return r.ok, r.status_code, r.text
 
+# === ФОРМИРОВАНИЕ СООБЩЕНИЯ ===
 def render_message(p: NotifyPayload) -> str:
-    """Собирает красивую карточку уведомления."""
     esc = lambda s: html.escape(s or "")
-    parts = []
-    parts.append("📦 <b>Уведомление о заявке</b>\n")
+    parts = ["📦 <b>Уведомление о заявке</b>", ""]
 
     if p.order_id:
         parts.append(f"🧾 <b>Заявка:</b> {esc(p.order_id)}")
-    if p.priority:  # ← Приоритет сразу после Заявка
+    if p.priority:
         parts.append(f"⭐ <b>Приоритет:</b> {esc(p.priority)}")
     if p.status:
         parts.append(f"🚚 <b>Статус:</b> {esc(p.status)}")
     if p.ship_date:
-        parts.append(f"📅 <b>Дата отгрузки:</b> {fmt_pretty_date(p.ship_date)}")
-    if p.arrival_date:
-        parts.append(f"📦 <b>Дата прибытия:</b> {fmt_pretty_date(p.arrival_date)}")
+        parts.append(f"📅 <b>Дата отгрузки:</b> {esc(p.ship_date)}")
+    if p.arrival:
+        parts.append(f"📦 <b>Дата прибытия:</b> {esc(p.arrival)}")
     if p.carrier:
         parts.append(f"🚛 <b>ТК:</b> {esc(p.carrier)}")
     if p.ttn:
         parts.append(f"📄 <b>№ ТТН:</b> {esc(p.ttn)}")
-    if p.responsible:
-        r = p.responsible
-        if r.username:
-            parts.append(f"👤 <b>Ответственный:</b> @{esc(r.username)}")
-        elif r.user_id:
-            parts.append(f"👤 <b>Ответственный:</b> tg://user?id={r.user_id}")
-        elif r.name:
-            parts.append(f"👤 <b>Ответственный:</b> {esc(r.name)}")
+    if p.applicant:
+        parts.append(f"👤 <b>Заявитель:</b> {esc(p.applicant)}")
+
+    # Добавляем дату и время отправки
+    ts = datetime.now().strftime("%d.%m.%Y, %H:%M")
+    parts.append("")
+    parts.append(f"🕒 <i>Отправлено: {ts}</i>")
 
     return "\n".join(parts)
 
-# === ROUTES ===
+# === API ===
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "time": datetime.now().isoformat()}
 
 @app.post("/notify")
 def notify(payload: NotifyPayload, authorization: str = Header(default="")):
@@ -131,4 +96,4 @@ def notify(payload: NotifyPayload, authorization: str = Header(default="")):
         print(f"Telegram error {sc}: {txt}")
         raise HTTPException(status_code=502, detail=f"Telegram error {sc}: {txt}")
 
-    return {"ok": True}
+    return {"ok": True, "sent": True, "status_code": sc}
