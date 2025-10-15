@@ -16,16 +16,16 @@ log = logging.getLogger("bot")
 
 app = FastAPI(title="Snab Notify + Bot", version="2.0.0")
 
-# ----- ENV -----
+# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # можно не использовать в вебхуке
-SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()  # id вашей группы, чтобы /notify слал туда
+SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()  # на будущее (команды по таблице)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
 
-# ---------- МОДЕЛИ ДЛЯ /notify ----------
+# ====== МОДЕЛИ для /notify ======
 class Responsible(BaseModel):
     name: Optional[str] = None
     username: Optional[str] = None  # без @
@@ -50,7 +50,7 @@ class NotifyPayload(BaseModel):
     items: List[Item] = []
 
 
-# ---------- СЕРВИСНЫЕ ----------
+# ====== ХЕЛПЕРЫ ======
 def tg_send_message(chat_id: str, text: str, parse_mode: Optional[str] = "HTML"):
     if not TG_API:
         log.error("BOT_TOKEN is empty; cannot call Telegram")
@@ -73,6 +73,7 @@ def escape(s: Optional[str]) -> str:
 
 def render_notify_message(p: NotifyPayload) -> str:
     parts = []
+    parts.append("📦 <b>Уведомление о заявке</b>\n")
     if p.order_id:
         parts.append(f"🧾 <b>Заявка:</b> {escape(p.order_id)}")
     if p.status:
@@ -89,11 +90,11 @@ def render_notify_message(p: NotifyPayload) -> str:
             parts.append(f"👤 <b>Заявитель:</b> tg://user?id={r.user_id}")
         elif r.name:
             parts.append(f"👤 <b>Заявитель:</b> {escape(r.name)}")
-    return "📦 <b>Уведомление о заявке</b>\n\n" + "\n".join(parts)
+    return "\n".join(parts)
 
 
 def load_sheet_rows() -> List[Dict[str, str]]:
-    """Опционально: читает опубликованный CSV (если указан SHEET_CSV_URL)."""
+    """(Опционально) читает опубликованный CSV из Google Sheets, если указан SHEET_CSV_URL."""
     if not SHEET_CSV_URL:
         return []
     r = requests.get(SHEET_CSV_URL, timeout=20)
@@ -103,7 +104,7 @@ def load_sheet_rows() -> List[Dict[str, str]]:
     return [dict(row) for row in reader]
 
 
-# ---------- ПУТИ ДЛЯ ПРОВЕРОК ----------
+# ====== ПРОБНЫЕ РОУТЫ ======
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -111,16 +112,16 @@ def health():
 
 @app.get("/tg")
 def tg_get_probe():
-    # простой GET, чтобы Telegram и вы могли увидеть, что маршрут жив
+    # простой GET, чтобы видно было, что маршрут существует
     return {"ok": True, "route": "/tg"}
 
 
-# ---------- ВЕБХУК TELEGRAM ----------
+# ====== ВЕБХУК TELEGRAM ======
 @app.post("/tg")
 async def tg_webhook(req: Request):
     """
     Основной вебхук Telegram. Обрабатывает /start, /help, /id.
-    Включите "Group Privacy: DISABLED" у бота, чтобы видеть сообщения в группе.
+    Важно: всегда быстро возвращаем 200 OK.
     """
     if not TG_API:
         raise HTTPException(status_code=500, detail="BOT_TOKEN is not set")
@@ -134,10 +135,9 @@ async def tg_webhook(req: Request):
 
     log.info("TG update: %s", json.dumps(update)[:2000])
 
-    # Определяем сообщение и чат
     msg = update.get("message") or update.get("channel_post")
     if not msg:
-        # для my_chat_member/прочих апдейтов просто 200 OK
+        # сервисные апдейты (my_chat_member и т.д.) просто подтверждаем
         return {"ok": True}
 
     chat = msg.get("chat", {})
@@ -150,18 +150,15 @@ async def tg_webhook(req: Request):
     last_name = from_user.get("last_name") or ""
     full_name = (" ".join([first_name, last_name])).strip() or username or str(user_id)
 
-    # Разбираем команды только если они действительно есть
-    # Telegram добавляет entities.type == "bot_command"
     entities = msg.get("entities") or []
     is_command = any(e.get("type") == "bot_command" for e in entities)
 
-    # Функции ответов
     def reply(text_: str):
         tg_send_message(str(chat_id), text_)
 
-    # Команды
     if is_command:
         cmd = text.split()[0].lower()
+
         if cmd.startswith("/start"):
             reply(
                 "👋 Привет! Я <b>BotSnab</b> — бот снабжения.\n"
@@ -184,22 +181,20 @@ async def tg_webhook(req: Request):
             reply(f"🪪 Ваш ID: <code>{user_id}</code>\nИмя: <b>{escape(full_name)}</b>")
             return {"ok": True}
 
-        # Неизвестная команда
         reply("❓ Неизвестная команда. Напишите /help")
         return {"ok": True}
 
-    # Если не команда — молча OK (чтобы не спамить в группах)
+    # если это не команда — молча OK (чтобы не спамить в группах)
     return {"ok": True}
 
 
-# ---------- ВАШ СТАРЫЙ ВХОД ДЛЯ УВЕДОМЛЕНИЙ ИЗ ТАБЛИЦ ----------
+# ====== ВХОД ДЛЯ УВЕДОМЛЕНИЙ ИЗ ТАБЛИЦ ======
 @app.post("/notify")
 def notify(payload: NotifyPayload, authorization: str = Header(default="")):
     # Авторизация по Bearer
     if WEBHOOK_SECRET and authorization != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Куда отправлять: если пришёл chat_id в ENV — используем его, иначе сообщение не шлём
     if not CHAT_ID:
         raise HTTPException(status_code=500, detail="CHAT_ID not configured")
 
