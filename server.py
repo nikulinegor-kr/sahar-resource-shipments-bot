@@ -7,24 +7,25 @@ import html
 import requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime, date, timedelta
-from fastapi import FastAPI, Request, Header, HTTPException
+
+from fastapi import FastAPI, Request, Header, HTTPException, Body
 from fastapi.responses import JSONResponse
 
 # ===== Конфигурация =====
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()                 # id группы для уведомлений
+SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()     # CSV для команд /my /status и т.д.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()   # общий секрет для /tg (опц.) и /notify (обязательно)
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-app = FastAPI(title="BotSnab • Поставки ТМЦ", version="1.3.0")
+app = FastAPI(title="BotSnab • Поставки ТМЦ", version="1.3.1")
 
-# ===== Кэш таблицы =====
+# ===== Кэш таблицы (для команд) =====
 _CSV_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": []}
 CSV_TTL = 60.0  # 1 минута
 
-# ===== Вспомогательные функции =====
+# ===== Вспомогательные =====
 def tg_send_message(chat_id: int | str, text: str, parse_mode="HTML"):
     if not BOT_TOKEN:
         return {"ok": False, "error": "BOT_TOKEN is empty"}
@@ -76,7 +77,7 @@ def _load_csv_rows() -> List[Dict[str, str]]:
     headers = [h.strip() for h in data[0]]
     rows = []
     for raw in data[1:]:
-        row = {headers[i]: raw[i].strip() if i < len(raw) else "" for i in range(len(headers))}
+        row = {headers[i]: raw[i].strip() if i < len(headers) else "" for i in range(len(headers))}
         rows.append(row)
     _CSV_CACHE.update({"ts": now, "rows": rows})
     return rows
@@ -101,7 +102,7 @@ def _normalize_row(row: Dict[str, str]) -> Dict[str, Any]:
         "tk": _field(row, "ТК", "Тк", "Транспортная компания"),
         "ttn": _field(row, "№ ТТН", "ТТН", "Номер ТТН"),
         "applicant": _field(row, "Заявитель", "Ответственный", "Исполнитель"),
-        "comment": _field(row, "Комментарий", "Комментарии"),  # если пусто — подставим "—"
+        "comment": _field(row, "Комментарий", "Комментарии"),
     }
 
 def _load_data() -> List[Dict[str, Any]]:
@@ -111,15 +112,15 @@ def _load_data() -> List[Dict[str, Any]]:
 def _fmt_card(item: Dict[str, Any]) -> str:
     parts = [
         "📦 <b>Уведомление о заявке</b>",
-        f"🧾 <b>Заявка:</b> {esc(item['request'])}" if item["request"] else "",
-        f"⭐ <b>Приоритет:</b> {esc(item['priority'])}" if item["priority"] else "",
-        f"🚚 <b>Статус:</b> {esc(item['status'])}" if item["status"] else "",
-        f"📅 <b>Дата отгрузки:</b> {_format_date_long(item['ship_date'])}" if item["ship_date"] else "",
-        f"📦 <b>Дата прибытия:</b> {_format_date_long(item['arrive_date'])}" if item["arrive_date"] else "",
-        f"🚛 <b>ТК:</b> {esc(item['tk'])}" if item["tk"] else "",
-        f"📄 <b>№ ТТН:</b> {esc(item['ttn'])}" if item["ttn"] else "",
-        f"👤 <b>Заявитель:</b> {esc(item['applicant'])}" if item["applicant"] else "",
-        f"📝 <b>Комментарий:</b> {esc(item['comment'] or '—')}",  # <-- если нет, ставим тире
+        f"🧾 <b>Заявка:</b> {esc(item.get('request'))}" if item.get("request") else "",
+        f"⭐ <b>Приоритет:</b> {esc(item.get('priority'))}" if item.get("priority") else "",
+        f"🚚 <b>Статус:</b> {esc(item.get('status'))}" if item.get("status") else "",
+        f"📅 <b>Дата отгрузки:</b> {_format_date_long(item.get('ship_date'))}" if item.get("ship_date") else "",
+        f"📦 <b>Дата прибытия:</b> {_format_date_long(item.get('arrive_date'))}" if item.get("arrive_date") else "",
+        f"🚛 <b>ТК:</b> {esc(item.get('tk'))}" if item.get("tk") else "",
+        f"📄 <b>№ ТТН:</b> {esc(item.get('ttn'))}" if item.get("ttn") else "",
+        f"👤 <b>Заявитель:</b> {esc(item.get('applicant'))}" if item.get("applicant") else "",
+        f"📝 <b>Комментарий:</b> {esc(item.get('comment') or '—')}",
     ]
     return "\n".join([p for p in parts if p])
 
@@ -193,7 +194,7 @@ def handle_command(text: str, chat_id: int, from_user: dict, bot_username: str):
     else:
         tg_send_message(chat_id, "Неизвестная команда. Напиши /help.")
 
-# ===== Роуты =====
+# ===== РОУТЫ =====
 @app.get("/")
 def root():
     return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify"]}
@@ -208,16 +209,72 @@ def tg_get():
 
 @app.post("/tg")
 async def tg_post(req: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    if WEBHOOK_SECRET and (x_telegram_bot_api_secret_token or "") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
+    # Если хотите проверять секрет Telegram webhook — раскомментируйте и добавьте secret_token при setWebhook
+    # if WEBHOOK_SECRET and (x_telegram_bot_api_secret_token or "") != WEBHOOK_SECRET:
+    #     raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="BOT_TOKEN not configured")
+
     data = await req.json()
-    msg = data.get("message", {})
-    text = (msg.get("text") or "").strip()
-    chat = msg.get("chat", {})
+    message = data.get("message", {})
+    text = (message.get("text") or "").strip()
+    chat = message.get("chat", {})
     chat_id = chat.get("id")
-    user = msg.get("from", {})
+    user = message.get("from", {})
+
     if text.startswith("/"):
-        me = requests.get(f"{TG_API}/getMe").json()
+        me = requests.get(f"{TG_API}/getMe", timeout=10).json()
         bot_username = me["result"]["username"] if me.get("ok") else ""
         handle_command(text, chat_id, user, bot_username)
+
+    return {"ok": True}
+
+# ===== /notify — для Google Apps Script =====
+@app.post("/notify")
+def notify_from_sheet(
+    payload: Dict[str, Any] = Body(...),
+    authorization: str = Header(default="")
+):
+    """
+    Принимает JSON из Google Apps Script и шлёт сообщение в группу.
+    Ожидаемые поля (все опциональны, берём что есть):
+      order_id, priority, status, ship_date, arrival_date, carrier, ttn, applicant, comment, chat_id
+    Авторизация: заголовок Authorization: Bearer <WEBHOOK_SECRET>
+    """
+    # Проверка секрета из заголовка
+    if WEBHOOK_SECRET and authorization != f"Bearer {WEBHOOK_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    chat = payload.get("chat_id") or CHAT_ID
+    if not chat:
+        raise HTTPException(status_code=400, detail="CHAT_ID is empty")
+
+    # Поддержим несколько алиасов из скрипта
+    request_name = payload.get("order_id") or payload.get("request") or payload.get("name")
+    priority     = payload.get("priority")
+    status       = payload.get("status")
+    ship_date    = _parse_date(payload.get("ship_date", ""))
+    arrive_date  = _parse_date(payload.get("arrival_date", "")) or _parse_date(payload.get("arrive_date", ""))
+    tk           = payload.get("carrier") or payload.get("tk")
+    ttn          = payload.get("ttn") or payload.get("waybill")
+    applicant    = payload.get("applicant") or payload.get("responsible_name") or payload.get("responsible", {}).get("name")
+    comment      = payload.get("comment")  # пусто = поставим "—" в карточке
+
+    item = {
+        "request": request_name,
+        "priority": priority,
+        "status": status,
+        "ship_date": ship_date,
+        "arrive_date": arrive_date,
+        "tk": tk,
+        "ttn": ttn,
+        "applicant": applicant,
+        "comment": comment,  # если None/"" — _fmt_card подставит "—"
+    }
+
+    text = _fmt_card(item)
+    res = tg_send_message(chat, text)
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=f"Telegram error: {res}")
     return {"ok": True}
