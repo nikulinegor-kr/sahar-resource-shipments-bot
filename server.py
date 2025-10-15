@@ -19,7 +19,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()   # общий секр
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-app = FastAPI(title="BotSnab • Поставки ТМЦ", version="1.3.1")
+app = FastAPI(title="BotSnab • Поставки ТМЦ", version="1.3.2")
 
 # ===== Кэш таблицы (для команд) =====
 _CSV_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": []}
@@ -70,31 +70,55 @@ def _load_csv_rows() -> List[Dict[str, str]]:
         return []
     r = requests.get(SHEET_CSV_URL, timeout=20)
     r.raise_for_status()
-    reader = csv.reader(io.StringIO(r.text))
+    # Убираем BOM и читаем CSV
+    text = r.content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
     data = list(reader)
     if not data:
         return []
     headers = [h.strip() for h in data[0]]
     rows = []
     for raw in data[1:]:
-        row = {headers[i]: raw[i].strip() if i < len(headers) else "" for i in range(len(headers))}
+        row = {}
+        for i, h in enumerate(headers):
+            row[h] = (raw[i].strip() if i < len(raw) else "")
         rows.append(row)
     _CSV_CACHE.update({"ts": now, "rows": rows})
     return rows
 
+def _norm(s: str) -> str:
+    """Нормализация ключей: нижний регистр, убрать лишние пробелы и двойные пробелы."""
+    return " ".join((s or "").strip().lower().split())
+
 def _field(row: Dict[str, str], *names: str) -> str:
+    """
+    Берём значение по одному из синонимов заголовка.
+    Учитываем строчные/пробелы. Работает даже если в таблице ' Комментарий  '.
+    """
+    # Прямая попытка
     for n in names:
         if n in row:
             return row.get(n, "")
-    keys = {k.strip().lower(): k for k in row}
+
+    # По нормализованной карте
+    norm_map = {_norm(k): k for k in row.keys()}
     for n in names:
-        if n.lower() in keys:
-            return row[keys[n.lower()]]
+        nn = _norm(n)
+        if nn in norm_map:
+            return row.get(norm_map[nn], "")
+
     return ""
+
+# полный пул синонимов для "Комментарий"
+COMMENT_HEADERS = [
+    "Комментарий", "Комментарии", "Коментарий", "комментарий", "коментарий",
+    "Примечание", "Примечания", "Прим.", "Примечание к заявке", "Комментарий к заявке",
+    "Комментарий к отгрузке", "Комментарий заказчика", "Заметки", "Notes"
+]
 
 def _normalize_row(row: Dict[str, str]) -> Dict[str, Any]:
     return {
-        "request": _field(row, "Заявка"),
+        "request": _field(row, "Заявка", "Название", "Наименование"),
         "priority": _field(row, "Приоритет"),
         "status": _field(row, "Статус"),
         "ship_date": _parse_date(_field(row, "Дата/О", "Дата О", "Дата отгрузки")),
@@ -102,7 +126,8 @@ def _normalize_row(row: Dict[str, str]) -> Dict[str, Any]:
         "tk": _field(row, "ТК", "Тк", "Транспортная компания"),
         "ttn": _field(row, "№ ТТН", "ТТН", "Номер ТТН"),
         "applicant": _field(row, "Заявитель", "Ответственный", "Исполнитель"),
-        "comment": _field(row, "Комментарий", "Комментарии"),
+        # комментарий подхватим из любого из заданных заголовков
+        "comment": next(( _field(row, h) for h in COMMENT_HEADERS if _field(row, h) ), ""),
     }
 
 def _load_data() -> List[Dict[str, Any]]:
@@ -238,11 +263,9 @@ def notify_from_sheet(
 ):
     """
     Принимает JSON из Google Apps Script и шлёт сообщение в группу.
-    Ожидаемые поля (все опциональны, берём что есть):
-      order_id, priority, status, ship_date, arrival_date, carrier, ttn, applicant, comment, chat_id
-    Авторизация: заголовок Authorization: Bearer <WEBHOOK_SECRET>
+    Поля (опциональны): order_id, priority, status, ship_date, arrival_date, carrier, ttn, applicant, comment, chat_id
+    Авторизация: Authorization: Bearer <WEBHOOK_SECRET>
     """
-    # Проверка секрета из заголовка
     if WEBHOOK_SECRET and authorization != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -250,7 +273,6 @@ def notify_from_sheet(
     if not chat:
         raise HTTPException(status_code=400, detail="CHAT_ID is empty")
 
-    # Поддержим несколько алиасов из скрипта
     request_name = payload.get("order_id") or payload.get("request") or payload.get("name")
     priority     = payload.get("priority")
     status       = payload.get("status")
@@ -259,7 +281,7 @@ def notify_from_sheet(
     tk           = payload.get("carrier") or payload.get("tk")
     ttn          = payload.get("ttn") or payload.get("waybill")
     applicant    = payload.get("applicant") or payload.get("responsible_name") or payload.get("responsible", {}).get("name")
-    comment      = payload.get("comment")  # пусто = поставим "—" в карточке
+    comment      = payload.get("comment")
 
     item = {
         "request": request_name,
@@ -270,7 +292,7 @@ def notify_from_sheet(
         "tk": tk,
         "ttn": ttn,
         "applicant": applicant,
-        "comment": comment,  # если None/"" — _fmt_card подставит "—"
+        "comment": comment,  # если None/"" — в карточке будет "—"
     }
 
     text = _fmt_card(item)
