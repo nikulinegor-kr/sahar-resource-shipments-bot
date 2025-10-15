@@ -1,19 +1,18 @@
+# --- базовый образ ---
 FROM python:3.11-slim
 
-# Чтобы ставилось быстрее и без мусора
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
+# --- рабочая директория внутри контейнера ---
 WORKDIR /app
 
-# Устанавливаем зависимости
+# --- установка зависимостей ---
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Кладём код
+# --- копируем весь проект ---
 COPY . .
 
-# Порт и старт
+# --- порт, который слушает uvicorn ---
 ENV PORT=8000
-EXPOSE 8000
+
+# --- команда запуска ---
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
