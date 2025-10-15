@@ -3,51 +3,40 @@ import os
 import io
 import csv
 import time
-import json
 import html
 import requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime, date, timedelta
-
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-# ====== Конфигурация из окружения ======
+# ===== Конфигурация =====
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # опционально (для /notify)
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # зарезервировано
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-# ====== Приложение ======
-app = FastAPI(title="BotSnab • TMC Shipments", version="1.2.0")
+app = FastAPI(title="BotSnab • Поставки ТМЦ", version="1.3.0")
 
-# ====== Кэш CSV ======
-_CSV_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": [], "headers": []}
-CSV_TTL = 60.0  # сек
+# ===== Кэш таблицы =====
+_CSV_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": []}
+CSV_TTL = 60.0  # 1 минута
 
-# ====== Утилиты ======
-def tg_send_message(chat_id: int | str, text: str, parse_mode: str = "HTML") -> Dict[str, Any]:
+# ===== Вспомогательные функции =====
+def tg_send_message(chat_id: int | str, text: str, parse_mode="HTML"):
     if not BOT_TOKEN:
         return {"ok": False, "error": "BOT_TOKEN is empty"}
+    r = requests.post(
+        f"{TG_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True},
+        timeout=15
+    )
     try:
-        r = requests.post(
-            f"{TG_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": True,
-            },
-            timeout=15,
-        )
-        try:
-            return r.json()
-        except Exception:
-            return {"ok": False, "status": r.status_code, "text": r.text}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return r.json()
+    except Exception:
+        return {"ok": False, "text": r.text}
 
 def esc(s: Optional[str]) -> str:
     return html.escape((s or "").strip())
@@ -68,7 +57,7 @@ def _format_date_long(d: Optional[date]) -> str:
         return ""
     months = [
         "января", "февраля", "марта", "апреля", "мая", "июня",
-        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
     ]
     return f"{d.day} {months[d.month - 1]} {d.year}"
 
@@ -76,69 +65,50 @@ def _load_csv_rows() -> List[Dict[str, str]]:
     now = time.time()
     if _CSV_CACHE["rows"] and now - _CSV_CACHE["ts"] < CSV_TTL:
         return _CSV_CACHE["rows"]
-
     if not SHEET_CSV_URL:
-        _CSV_CACHE.update({"ts": now, "rows": [], "headers": []})
         return []
-
     r = requests.get(SHEET_CSV_URL, timeout=20)
     r.raise_for_status()
-    content = r.content.decode("utf-8")
-    reader = csv.reader(io.StringIO(content))
-    rows = list(reader)
-    if not rows:
-        _CSV_CACHE.update({"ts": now, "rows": [], "headers": []})
+    reader = csv.reader(io.StringIO(r.text))
+    data = list(reader)
+    if not data:
         return []
+    headers = [h.strip() for h in data[0]]
+    rows = []
+    for raw in data[1:]:
+        row = {headers[i]: raw[i].strip() if i < len(raw) else "" for i in range(len(headers))}
+        rows.append(row)
+    _CSV_CACHE.update({"ts": now, "rows": rows})
+    return rows
 
-    headers = [h.strip() for h in rows[0]]
-    data = []
-    for raw in rows[1:]:
-        row = {}
-        for i, h in enumerate(headers):
-            row[h] = (raw[i].strip() if i < len(raw) else "")
-        data.append(row)
-
-    _CSV_CACHE.update({"ts": now, "rows": data, "headers": headers})
-    return data
-
-def _field(row: Dict[str, str], *candidates: str) -> str:
-    for key in candidates:
-        if key in row:
-            return row.get(key, "")
-    # поправка на лишние пробелы в заголовках
-    keys = {k.strip(): k for k in row.keys()}
-    for key in candidates:
-        if key in keys:
-            return row.get(keys[key], "")
+def _field(row: Dict[str, str], *names: str) -> str:
+    for n in names:
+        if n in row:
+            return row.get(n, "")
+    keys = {k.strip().lower(): k for k in row}
+    for n in names:
+        if n.lower() in keys:
+            return row[keys[n.lower()]]
     return ""
 
-def _who_is_applicant(row: Dict[str, str]) -> str:
-    v = _field(row, "Заявитель", "Заявитель:", "Заявитель(ФИО)")
-    if not v:
-        v = _field(row, "Исполнитель", "Ответственный")
-    return v
-
 def _normalize_row(row: Dict[str, str]) -> Dict[str, Any]:
-    """Единые имена полей для работы команд."""
     return {
-        "request": _field(row, "Заявка", "Название", "Наименование"),
+        "request": _field(row, "Заявка"),
         "priority": _field(row, "Приоритет"),
         "status": _field(row, "Статус"),
         "ship_date": _parse_date(_field(row, "Дата/О", "Дата О", "Дата отгрузки")),
         "arrive_date": _parse_date(_field(row, "Дата/Д", "Дата Д", "Дата прибытия")),
         "tk": _field(row, "ТК", "Тк", "Транспортная компания"),
-        "ttn": _field(row, "№ ТТН", "№ТТН", "ТТН"),
-        "applicant": _who_is_applicant(row),
-        # НОВОЕ: комментарий (любой из названий колонок)
-        "comment": _field(row, "Комментарий", "Комментарии"),
-        "raw": row,
+        "ttn": _field(row, "№ ТТН", "ТТН", "Номер ТТН"),
+        "applicant": _field(row, "Заявитель", "Ответственный", "Исполнитель"),
+        "comment": _field(row, "Комментарий", "Комментарии"),  # если пусто — подставим "—"
     }
 
 def _load_data() -> List[Dict[str, Any]]:
     return [_normalize_row(r) for r in _load_csv_rows()]
 
+# ===== Форматирование карточки =====
 def _fmt_card(item: Dict[str, Any]) -> str:
-    """Карточка заявки — добавлен блок «Комментарий», если есть."""
     parts = [
         "📦 <b>Уведомление о заявке</b>",
         f"🧾 <b>Заявка:</b> {esc(item['request'])}" if item["request"] else "",
@@ -149,210 +119,105 @@ def _fmt_card(item: Dict[str, Any]) -> str:
         f"🚛 <b>ТК:</b> {esc(item['tk'])}" if item["tk"] else "",
         f"📄 <b>№ ТТН:</b> {esc(item['ttn'])}" if item["ttn"] else "",
         f"👤 <b>Заявитель:</b> {esc(item['applicant'])}" if item["applicant"] else "",
-        # НОВОЕ: комментарий, только если не пустой
-        f"📝 <b>Комментарий:</b> {esc(item['comment'])}" if item["comment"] else "",
+        f"📝 <b>Комментарий:</b> {esc(item['comment'] or '—')}",  # <-- если нет, ставим тире
     ]
     return "\n".join([p for p in parts if p])
 
-def _paginate(items: List[Dict[str, Any]], limit: int = 10) -> List[List[Dict[str, Any]]]:
-    if limit <= 0:
-        limit = 10
-    pages = []
-    for i in range(0, len(items), limit):
-        pages.append(items[i:i + limit])
-    return pages
-
-def _reply_list(chat_id: int, title: str, items: List[Dict[str, Any]], limit: int = 6):
+def _reply_list(chat_id: int, title: str, items: List[Dict[str, Any]]):
     if not items:
-        tg_send_message(chat_id, f"Ничего не найдено по запросу: {esc(title)}")
+        tg_send_message(chat_id, f"❌ Ничего не найдено по запросу <b>{esc(title)}</b>")
         return
-    pages = _paginate(items, limit)
-    for idx, page in enumerate(pages, 1):
-        header = f"🔎 <b>{esc(title)}</b> • стр. {idx}/{len(pages)}"
-        body = "\n\n".join(_fmt_card(x) for x in page)
-        tg_send_message(chat_id, f"{header}\n\n{body}")
+    msg = f"🔎 <b>{esc(title)}</b>\n\n" + "\n\n".join(_fmt_card(i) for i in items[:10])
+    tg_send_message(chat_id, msg)
 
-# ====== HELP ======
-def get_help_text() -> str:
-    return (
-        "📦 <b>BotSnab — команды</b>\n\n"
-        "• /start — начать работу с ботом\n"
-        "• /help — список доступных команд\n"
-        "• /id — показать ваш Telegram ID\n\n"
-        "👤 <b>Личные запросы</b>\n"
-        "• /my — показать ваши заявки (по «Заявитель»/«Исполнитель»)\n"
-        "• /status &lt;статус&gt; — заявки по статусу (напр.: /status В пути)\n"
-        "• /today — отгрузки сегодня\n"
-        "• /week — отгрузки на этой неделе\n"
-        "• /search &lt;текст&gt; — найти заявку по названию\n"
-        "• /priority — все аварийные заявки\n"
-        "• /last — последние обновления по заявкам\n\n"
-        "ℹ️ В группе пишите команду отдельным сообщением. Если включена privacy, используйте @имябота: /help@ИмяБота"
-    )
-
-# ====== Команды ======
+# ===== Команды =====
 def handle_command(text: str, chat_id: int, from_user: dict, bot_username: str):
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
-    args = parts[1] if len(parts) > 1 else ""
-
+    arg = parts[1].strip() if len(parts) > 1 else ""
     if '@' in cmd:
         base, at = cmd.split('@', 1)
         if at.lower() != bot_username.lower():
             return
         cmd = base
-
-    user_id = from_user.get("id")
-    user_name = from_user.get("first_name", "")
-
-    data = None
-
-    def ensure_data():
-        nonlocal data
-        if data is None:
-            data = _load_data()
-        return data
+    data = _load_data()
+    today = date.today()
 
     if cmd == "/start":
-        tg_send_message(chat_id, "👋 Готов к работе. Напишите /help, чтобы увидеть все команды.")
-        return
-
-    if cmd == "/help":
-        tg_send_message(chat_id, get_help_text())
-        return
-
-    if cmd == "/id":
-        tg_send_message(chat_id, f"Ваш Telegram ID: <code>{user_id}</code>")
-        return
-
-    if cmd == "/my":
-        rows = ensure_data()
-        tokens = []
-        if from_user.get("username"):
-            tokens.append(from_user["username"])
-        if user_name:
-            tokens.append(user_name)
-
-        def belongs(r):
-            who = (r["applicant"] or "").lower()
-            return any(t and t.lower() in who for t in tokens)
-
-        items = [r for r in rows if belongs(r)]
+        tg_send_message(chat_id, "👋 Бот снабжения готов к работе. Напиши /help для списка команд.")
+    elif cmd == "/help":
+        tg_send_message(chat_id,
+            "📦 <b>Команды BotSnab</b>\n"
+            "• /start — начать работу\n"
+            "• /my — мои заявки (по ФИО или username)\n"
+            "• /status <b>СТАТУС</b> — заявки по статусу\n"
+            "• /today — отгрузки сегодня\n"
+            "• /week — отгрузки на этой неделе\n"
+            "• /search <b>ТЕКСТ</b> — поиск заявки по названию\n"
+            "• /priority — аварийные заявки\n"
+            "• /last — последние заявки\n"
+            "• /id — показать ваш Telegram ID"
+        )
+    elif cmd == "/id":
+        tg_send_message(chat_id, f"Ваш Telegram ID: <code>{from_user.get('id')}</code>")
+    elif cmd == "/my":
+        name = (from_user.get("first_name") or "").lower()
+        username = (from_user.get("username") or "").lower()
+        items = [r for r in data if username in (r["applicant"] or "").lower() or name in (r["applicant"] or "").lower()]
         _reply_list(chat_id, "Ваши заявки", items)
-        return
-
-    if cmd == "/status":
-        status = args.strip()
-        if not status:
-            tg_send_message(chat_id, "Укажите статус, например: <code>/status В пути</code>")
-            return
-        rows = ensure_data()
-        items = [r for r in rows if (r["status"] or "").lower() == status.lower()]
-        _reply_list(chat_id, f"Заявки со статусом «{status}»", items)
-        return
-
-    if cmd == "/today":
-        rows = ensure_data()
-        today = date.today()
-        items = [r for r in rows if r["ship_date"] == today]
+    elif cmd == "/status":
+        if not arg:
+            tg_send_message(chat_id, "❗ Укажите статус, например: /status В пути")
+        else:
+            items = [r for r in data if (r["status"] or "").lower() == arg.lower()]
+            _reply_list(chat_id, f"Заявки со статусом «{arg}»", items)
+    elif cmd == "/today":
+        items = [r for r in data if r["ship_date"] == today]
         _reply_list(chat_id, "Отгрузки сегодня", items)
-        return
-
-    if cmd == "/week":
-        rows = ensure_data()
-        today = date.today()
-        start_week = today - timedelta(days=today.weekday())
-        end_week = start_week + timedelta(days=6)
-        items = [r for r in rows if r["ship_date"] and start_week <= r["ship_date"] <= end_week]
+    elif cmd == "/week":
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        items = [r for r in data if r["ship_date"] and start <= r["ship_date"] <= end]
         _reply_list(chat_id, "Поставки на этой неделе", items)
-        return
-
-    if cmd == "/search":
-        q = args.strip()
-        if not q:
-            tg_send_message(chat_id, "Укажите текст для поиска: <code>/search фильтра</code>")
-            return
-        rows = ensure_data()
-        qq = q.lower()
-        items = [r for r in rows if qq in (r["request"] or "").lower()]
-        _reply_list(chat_id, f"Поиск: «{q}»", items)
-        return
-
-    if cmd == "/priority":
-        rows = ensure_data()
-        items = [r for r in rows if (r["priority"] or "").lower().startswith("авар")]
+    elif cmd == "/search":
+        if not arg:
+            tg_send_message(chat_id, "❗ Укажите текст для поиска: /search фильтра")
+        else:
+            items = [r for r in data if arg.lower() in (r["request"] or "").lower()]
+            _reply_list(chat_id, f"Результаты поиска: {arg}", items)
+    elif cmd == "/priority":
+        items = [r for r in data if (r["priority"] or "").lower().startswith("авар")]
         _reply_list(chat_id, "Аварийные заявки", items)
-        return
+    elif cmd == "/last":
+        _reply_list(chat_id, "Последние заявки", data[-10:])
+    else:
+        tg_send_message(chat_id, "Неизвестная команда. Напиши /help.")
 
-    if cmd == "/last":
-        rows = ensure_data()
-        items = rows[-10:] if len(rows) > 10 else rows
-        _reply_list(chat_id, "Последние обновления", items)
-        return
-
-    tg_send_message(chat_id, "Не понимаю команду. Напишите /help")
-
-# ====== Роуты ======
+# ===== Роуты =====
 @app.get("/")
 def root():
-    return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify (reserved)", "/docs"]}
+    return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify"]}
 
 @app.get("/health")
 def health():
     return {"ok": True, "service": "snab-bot", "webhook": "/tg"}
 
 @app.get("/tg")
-def tg_probe():
+def tg_get():
     return {"ok": True, "route": "/tg"}
 
 @app.post("/tg")
-async def tg_webhook(req: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    if WEBHOOK_SECRET:
-        # Если настроите secret в BotFather — включите проверку:
-        # if (x_telegram_bot_api_secret_token or "") != WEBHOOK_SECRET:
-        #     raise HTTPException(status_code=403, detail="Invalid webhook secret")
-        pass
-
-    if not BOT_TOKEN:
-        raise HTTPException(status_code=500, detail="BOT_TOKEN not configured")
-
-    try:
-        update = await req.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Bad JSON")
-
-    # имя бота (для /help@ИмяБота)
-    bot_username = ""
-    try:
-        me = requests.get(f"{TG_API}/getMe", timeout=10).json()
-        if me.get("ok"):
-            bot_username = me["result"]["username"]
-    except Exception:
-        pass
-
-    message = update.get("message") or update.get("edited_message") or {}
-    text = (message.get("text") or "").strip()
-    chat = message.get("chat") or {}
+async def tg_post(req: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
+    if WEBHOOK_SECRET and (x_telegram_bot_api_secret_token or "") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    data = await req.json()
+    msg = data.get("message", {})
+    text = (msg.get("text") or "").strip()
+    chat = msg.get("chat", {})
     chat_id = chat.get("id")
-    from_user = message.get("from") or {}
-
+    user = msg.get("from", {})
     if text.startswith("/"):
-        handle_command(text, chat_id, from_user, bot_username)
-
-    return JSONResponse({"ok": True})
-
-# ====== Тестовая отправка ======
-@app.post("/notify")
-def notify_example():
-    if not CHAT_ID:
-        return {"ok": False, "error": "CHAT_ID is empty"}
-    msg = (
-        "📦 <b>Уведомление о заявке</b>\n"
-        "🧾 <b>Заявка:</b> Пример\n"
-        "⭐ <b>Приоритет:</b> Аварийно\n"
-        "🚚 <b>Статус:</b> В пути\n"
-        "📅 <b>Дата отгрузки:</b> 13 октября 2025\n"
-        "📝 <b>Комментарий:</b> Пример комментария\n"
-        "👤 <b>Заявитель:</b> Иванов И.И."
-    )
-    return tg_send_message(CHAT_ID, msg)
+        me = requests.get(f"{TG_API}/getMe").json()
+        bot_username = me["result"]["username"] if me.get("ok") else ""
+        handle_command(text, chat_id, user, bot_username)
+    return {"ok": True}
