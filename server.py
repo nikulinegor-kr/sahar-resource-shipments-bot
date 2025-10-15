@@ -1,228 +1,194 @@
-import os
-import html
-import requests
+# server.py
+import os, html, requests
+from fastapi import FastAPI, Request, Header, HTTPException
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, Header, HTTPException
-
-# =============================
-# ENV
-# =============================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # группа/чат для уведомлений
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # секрет для /notify (из таблицы)
-SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()  # опционально, для команд
-SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL", "").strip()  # URL Web App GAS (конец /exec)
-SHEET_SCRIPT_SECRET = os.getenv("SHEET_SCRIPT_SECRET", "").strip()  # тот же секрет, что и в GAS
+CHAT_ID   = os.getenv("CHAT_ID", "").strip()   # дефолтный чат для /notify
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL", "").strip()
+SHEET_API_KEY = os.getenv("SHEET_API_KEY", "").strip()
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-app = FastAPI(title="Snab Notify Bot", version="1.2.0")
+app = FastAPI(title="Snab Notify Bot", version="1.4.0")
 
-# =============================
-# Формат входящего JSON из таблицы
-# =============================
-class OrderPayloadDict(Dict[str, Any]):
-    """подсказка для линтеров, обычный dict"""
+def esc(s: Optional[str]) -> str:
+  return html.escape((s or "").strip())
 
+def tg_send(chat_id: str|int, text: str, parse_mode="HTML", reply_markup: Optional[dict]=None):
+  url = f"{TG_API}/sendMessage"
+  payload = {
+    "chat_id": chat_id,
+    "text": text,
+    "parse_mode": parse_mode,
+    "disable_web_page_preview": True,
+  }
+  if reply_markup:
+    payload["reply_markup"] = reply_markup
+  r = requests.post(url, json=payload, timeout=15)
+  try:
+    return r.json()
+  except Exception:
+    return {"ok": False, "status": r.status_code, "text": r.text}
 
-# =============================
-# Telegram helpers
-# =============================
-def tg_send_message(
-    text: str,
-    parse_mode: str = "HTML",
-    reply_markup: Optional[dict] = None,
-    chat_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Отправка сообщения в TG."""
-    if not BOT_TOKEN:
-        return {"ok": False, "error": "BOT_TOKEN missing"}
+def tg_edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[dict]):
+  url = f"{TG_API}/editMessageReplyMarkup"
+  r = requests.post(url, json={
+    "chat_id": chat_id,
+    "message_id": message_id,
+    "reply_markup": reply_markup
+  }, timeout=10)
+  return r.json()
 
-    url = f"{TG_API}/sendMessage"
-    payload = {
-        "chat_id": chat_id or CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+def tg_answer_cb(cb_id: str, text: str, alert: bool=False):
+  url = f"{TG_API}/answerCallbackQuery"
+  requests.post(url, json={"callback_query_id": cb_id, "text": text, "show_alert": alert}, timeout=10)
 
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        return r.json()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def tg_answer_callback(callback_query_id: str):
-    """Убрать «часики» после нажатия кнопки."""
-    if not BOT_TOKEN or not callback_query_id:
-        return
-    try:
-        requests.post(
-            f"{TG_API}/answerCallbackQuery",
-            json={"callback_query_id": callback_query_id},
-            timeout=5,
-        )
-    except Exception:
-        pass
-
-
-# =============================
-# Текст уведомления
-# =============================
-def format_order_text(data: Dict[str, Any]) -> str:
-    g = lambda k: (data.get(k) or "").strip()
-
-    lines = ["📦 Уведомление о заявке"]
-    order = g("order_id") or "—"
-    lines.append(f"🧾 Заявка: {html.escape(order)}")
-
-    if g("priority"):
-        lines.append(f"⭐ Приоритет: {html.escape(g('priority'))}")
-    if g("status"):
-        lines.append(f"🚚 Статус: {html.escape(g('status'))}")
-    if g("carrier"):
-        lines.append(f"🚛 ТК: {html.escape(g('carrier'))}")
-    if g("ttn"):
-        lines.append(f"📄 № ТТН: {html.escape(g('ttn'))}")
-    if g("ship_date"):
-        lines.append(f"📅 Дата отгрузки: {html.escape(g('ship_date'))}")
-    if g("arrival"):
-        lines.append(f"📅 Дата прибытия: {html.escape(g('arrival'))}")
-    if g("applicant"):
-        lines.append(f"👤 Заявитель: {html.escape(g('applicant'))}")
-    if g("comment"):
-        lines.append(f"📝 Комментарий: {html.escape(g('comment'))}")
-
-    return "\n".join(lines)
-
-
-def build_inline_keyboard_for_order(data: Dict[str, Any]) -> Optional[dict]:
-    """Кнопку показываем только при статусе «Доставлено в ТК»."""
-    status = (data.get("status") or "").strip().lower()
-    order_id = (data.get("order_id") or "").strip()
-    if not order_id:
-        return None
-
-    if status == "доставлено в тк":
-        cb = f"received|{order_id}"
-        return {"inline_keyboard": [[{"text": "✅ ТМЦ ПОЛУЧЕНО", "callback_data": cb}]]}
+def keyboard_for_status(data: Dict[str, Any]) -> Optional[dict]:
+  """Покажем кнопку только если статус = 'Доставлено в ТК'."""
+  status = (data.get("status") or "").strip().lower()
+  order  = (data.get("order_id") or "").strip()
+  if not order:
     return None
+  if status != "доставлено в тк":
+    return None
+  return {
+    "inline_keyboard": [[
+      {"text": "📥 ТМЦ ПОЛУЧЕНО", "callback_data": f"recv|{order}"}
+    ]]
+  }
 
+def disabled_keyboard() -> dict:
+  """Неактивная кнопка — формально кнопка остаётся, но с 'noop'."""
+  return {
+    "inline_keyboard": [[
+      {"text": "✅ Получено", "callback_data": "noop"}
+    ]]
+  }
 
-# =============================
-# Служебные роуты
-# =============================
+def format_order_text(data: Dict[str, Any]) -> str:
+  g = lambda k: (data.get(k) or "").strip()
+  lines = ["📦 Уведомление о заявке"]
+  lines.append(f"🧾 Заявка: {esc(g('order_id') or '—')}")
+  if g("priority"):   lines.append(f"⭐ Приоритет: {esc(g('priority'))}")
+  if g("status"):     lines.append(f"🚚 Статус: {esc(g('status'))}")
+  if g("carrier"):    lines.append(f"🚛 ТК: {esc(g('carrier'))}")
+  if g("ttn"):        lines.append(f"📄 № ТТН: {esc(g('ttn'))}")
+  if g("ship_date"):  lines.append(f"📅 Дата отгрузки: {esc(g('ship_date'))}")
+  if g("arrival"):    lines.append(f"📅 Дата прибытия: {esc(g('arrival'))}")
+  if g("applicant"):  lines.append(f"👤 Заявитель: {esc(g('applicant'))}")
+  if g("comment"):    lines.append(f"📝 Комментарий: {esc(g('comment'))}")
+  return "\n".join(lines)
+
 @app.get("/")
 def root():
-    return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify", "/docs"]}
-
+  return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "snab-bot", "webhook": "/tg"}
-
+  return {"ok": True, "service": "snab-bot", "webhook": "/tg"}
 
 @app.get("/tg")
-def get_tg():
-    return {"ok": True, "route": "/tg"}
+def tg_get():
+  return {"ok": True, "route": "/tg"}
 
-
-# =============================
-# Получение из Google Sheets (таблицы)
-# =============================
+# Таблица → бот: уведомление
 @app.post("/notify")
 async def notify(req: Request, authorization: Optional[str] = Header(None)):
-    # простая защита секретом
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    token = authorization.split("Bearer ")[-1].strip()
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid token")
+  if not authorization or not authorization.startswith("Bearer "):
+    raise HTTPException(status_code=401, detail="Missing Authorization header")
+  token = authorization.split("Bearer ", 1)[-1].strip()
+  if token != WEBHOOK_SECRET:
+    raise HTTPException(status_code=401, detail="Invalid token")
 
-    try:
-        data: OrderPayloadDict = await req.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="Body must be JSON object")
+  data = await req.json()
+  text = format_order_text(data)
+  kb = keyboard_for_status(data)  # если «Доставлено в ТК» — добавим кнопку
+  r = tg_send(CHAT_ID, text, reply_markup=kb)
+  return {"ok": True, "telegram_response": r}
 
-    text = format_order_text(data)
-    keyboard = build_inline_keyboard_for_order(data)
-    res = tg_send_message(text, reply_markup=keyboard)
-    return {"ok": True, "telegram_response": res}
-
-
-# =============================
-# Telegram webhook: команды и callback-кнопки
-# =============================
+# Telegram webhook
 @app.post("/tg")
-async def telegram_webhook(req: Request):
-    update = await req.json()
+async def tg_webhook(req: Request):
+  upd = await req.json()
+  print("TG update:", upd)
 
-    # 1) callback-кнопки
-    if "callback_query" in update:
-        cq = update["callback_query"]
-        data = cq.get("data", "")
-        cb_id = cq.get("id")
-        tg_answer_callback(cb_id)
+  # Нажатие на кнопку
+  if "callback_query" in upd:
+    cq = upd["callback_query"]
+    cb_id = cq.get("id")
+    msg = cq.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    data = (cq.get("data") or "").strip()
 
-        if data.startswith("received|"):
-            order_id = data.split("|", 1)[1].strip()
-            # шлём в Apps Script команду на обновление
-            if SHEET_SCRIPT_URL and SHEET_SCRIPT_SECRET:
-                payload = {
-                    "action": "received",
-                    "order_id": order_id,
-                    "secret": SHEET_SCRIPT_SECRET,  # т.к. GAS не отдаёт заголовки в doPost
-                }
-                try:
-                    resp = requests.post(
-                        SHEET_SCRIPT_URL, json=payload, timeout=10
-                    )
-                    ok = 200 <= resp.status_code < 300
-                    if ok:
-                        tg_send_message(f"✅ Получение подтверждено по заявке <b>{html.escape(order_id)}</b>.")
-                    else:
-                        tg_send_message(
-                            f"⚠️ Не удалось обновить статус для <b>{html.escape(order_id)}</b>: {resp.text}"
-                        )
-                except Exception as e:
-                    tg_send_message(f"⚠️ Ошибка связи с таблицей по заявке <b>{html.escape(order_id)}</b>: {e}")
+    if data.startswith("recv|"):
+      order_id = data.split("|", 1)[1]
 
-        return {"ok": True, "handled": "callback"}
+      # Шлём в Google Apps Script — установить статус «Доставлено»
+      if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
+        tg_answer_cb(cb_id, "Ошибка конфигурации (нет SHEET_SCRIPT_URL/SHEET_API_KEY)", True)
+        return {"ok": False}
 
-    # 2) простые команды (минимум)
-    if "message" in update:
-        msg = update["message"]
-        text = (msg.get("text") or "").strip()
-        chat_id = msg.get("chat", {}).get("id")
+      try:
+        r = requests.post(SHEET_SCRIPT_URL, json={
+          "api_key": SHEET_API_KEY,
+          "action": "mark_received",
+          "order_id": order_id
+        }, timeout=15)
+        js = r.json()
+      except Exception as e:
+        tg_answer_cb(cb_id, f"Ошибка связи с таблицей: {e}", True)
+        return {"ok": False}
 
-        if text.startswith("/start"):
-            tg_send_message(
-                "Привет! Я бот снабжения.\nКоманды: /help — список команд /id — показать ваш Telegram ID",
-                chat_id=chat_id,
-            )
-        elif text.startswith("/help"):
-            tg_send_message(
-                "Доступные команды:\n/start — начать\n/help — список команд\n/id — показать ваш Telegram ID",
-                chat_id=chat_id,
-            )
-        elif text.startswith("/id"):
-            user = msg.get("from", {})
-            uid = user.get("id")
-            uname = user.get("username")
-            tg_send_message(
-                f"Ваш ID: <b>{uid}</b>\nПользователь: @{uname}" if uname else f"Ваш ID: <b>{uid}</b>",
-                chat_id=chat_id,
-            )
-        else:
-            # игнор прочего текста
-            pass
+      if not js.get("ok"):
+        tg_answer_cb(cb_id, f"Не удалось обновить: {js.get('error','unknown')}", True)
+        return {"ok": False}
 
-        return {"ok": True, "handled": "message"}
+      # Успех/уже отмечено — делаем кнопку неактивной
+      tg_edit_reply_markup(chat_id, message_id, disabled_keyboard())
+      if js.get("already"):
+        tg_answer_cb(cb_id, "Уже было отмечено ранее")
+      else:
+        tg_answer_cb(cb_id, "Готово: статус «Доставлено»")
+      return {"ok": True}
 
+    # Неактивная кнопка (noop)
+    if data == "noop":
+      tg_answer_cb(cb_id, "Статус уже отмечен", False)
+      return {"ok": True}
+
+    # Прочие — просто квитируем
+    tg_answer_cb(cb_id, "OK")
     return {"ok": True}
+
+  # Сообщения (для /start, /help, /id)
+  msg = upd.get("message") or upd.get("channel_post")
+  if msg:
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+    cmd = text.split()[0].lower() if text else ""
+    if "@" in cmd:
+      cmd = cmd.split("@", 1)[0]
+
+    if cmd == "/start":
+      tg_send(chat_id,
+              "👋 Привет! Я бот снабжения.\n"
+              "Доступные команды:\n"
+              "• /help — список команд\n"
+              "• /id — показать ваш Telegram ID")
+    elif cmd == "/help":
+      tg_send(chat_id,
+              "🛠 Команды:\n"
+              "/id — показать ваш Telegram ID\n"
+              "Уведомления из таблицы приходят автоматически.")
+    elif cmd == "/id":
+      uid = msg.get("from", {}).get("id")
+      tg_send(chat_id, f"🧾 Ваш Telegram ID: <code>{uid}</code>")
+  return {"ok": True}
+
+if __name__ == "__main__":
+  import uvicorn
+  uvicorn.run("server:app", host="0.0.0.0", port=8000)
