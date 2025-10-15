@@ -5,7 +5,6 @@ import csv
 import time
 import json
 import html
-import math
 import requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime, date, timedelta
@@ -15,24 +14,20 @@ from fastapi.responses import JSONResponse
 
 # ====== Конфигурация из окружения ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # опционально
+CHAT_ID = os.getenv("CHAT_ID", "").strip()  # опционально (для /notify)
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # зарезервировано
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 # ====== Приложение ======
-app = FastAPI(title="BotSnab • TMC Shipments", version="1.1.0")
+app = FastAPI(title="BotSnab • TMC Shipments", version="1.2.0")
 
-# ====== Кэш CSV (чтобы не долбить таблицу каждую команду) ======
-_CSV_CACHE: Dict[str, Any] = {
-    "ts": 0.0,
-    "rows": [],
-    "headers": []
-}
+# ====== Кэш CSV ======
+_CSV_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": [], "headers": []}
 CSV_TTL = 60.0  # сек
 
-# ====== Вспомогательные ======
+# ====== Утилиты ======
 def tg_send_message(chat_id: int | str, text: str, parse_mode: str = "HTML") -> Dict[str, Any]:
     if not BOT_TOKEN:
         return {"ok": False, "error": "BOT_TOKEN is empty"}
@@ -43,9 +38,9 @@ def tg_send_message(chat_id: int | str, text: str, parse_mode: str = "HTML") -> 
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": parse_mode,
-                "disable_web_page_preview": True
+                "disable_web_page_preview": True,
             },
-            timeout=15
+            timeout=15,
         )
         try:
             return r.json()
@@ -54,18 +49,10 @@ def tg_send_message(chat_id: int | str, text: str, parse_mode: str = "HTML") -> 
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
 def esc(s: Optional[str]) -> str:
     return html.escape((s or "").strip())
 
-
 def _parse_date(s: str) -> Optional[date]:
-    """
-    Поддержка форматов:
-      - 2025-10-13
-      - 13.10.25, 13.10.2025
-      - 13/10/2025
-    """
     s = (s or "").strip()
     if not s:
         return None
@@ -76,19 +63,16 @@ def _parse_date(s: str) -> Optional[date]:
             pass
     return None
 
-
 def _format_date_long(d: Optional[date]) -> str:
     if not d:
         return ""
     months = [
         "января", "февраля", "марта", "апреля", "мая", "июня",
-        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
     ]
     return f"{d.day} {months[d.month - 1]} {d.year}"
 
-
 def _load_csv_rows() -> List[Dict[str, str]]:
-    """Загрузить строки из CSV с кэшем."""
     now = time.time()
     if _CSV_CACHE["rows"] and now - _CSV_CACHE["ts"] < CSV_TTL:
         return _CSV_CACHE["rows"]
@@ -117,31 +101,25 @@ def _load_csv_rows() -> List[Dict[str, str]]:
     _CSV_CACHE.update({"ts": now, "rows": data, "headers": headers})
     return data
 
-
 def _field(row: Dict[str, str], *candidates: str) -> str:
-    """Вытянуть значение по одному из возможных заголовков (на всякий случай)."""
     for key in candidates:
         if key in row:
             return row.get(key, "")
-    # иногда заголовки с лишними пробелами
+    # поправка на лишние пробелы в заголовках
     keys = {k.strip(): k for k in row.keys()}
     for key in candidates:
         if key in keys:
             return row.get(keys[key], "")
     return ""
 
-
 def _who_is_applicant(row: Dict[str, str]) -> str:
-    # Основное поле — «Заявитель»
     v = _field(row, "Заявитель", "Заявитель:", "Заявитель(ФИО)")
     if not v:
-        # запасной вариант — «Исполнитель»
         v = _field(row, "Исполнитель", "Ответственный")
     return v
 
-
 def _normalize_row(row: Dict[str, str]) -> Dict[str, Any]:
-    """Приведение полей к единым именам для логики команд."""
+    """Единые имена полей для работы команд."""
     return {
         "request": _field(row, "Заявка", "Название", "Наименование"),
         "priority": _field(row, "Приоритет"),
@@ -151,16 +129,16 @@ def _normalize_row(row: Dict[str, str]) -> Dict[str, Any]:
         "tk": _field(row, "ТК", "Тк", "Транспортная компания"),
         "ttn": _field(row, "№ ТТН", "№ТТН", "ТТН"),
         "applicant": _who_is_applicant(row),
-        "raw": row,  # оставим всё исходное
+        # НОВОЕ: комментарий (любой из названий колонок)
+        "comment": _field(row, "Комментарий", "Комментарии"),
+        "raw": row,
     }
-
 
 def _load_data() -> List[Dict[str, Any]]:
     return [_normalize_row(r) for r in _load_csv_rows()]
 
-
 def _fmt_card(item: Dict[str, Any]) -> str:
-    """Красивая карточка заявки."""
+    """Карточка заявки — добавлен блок «Комментарий», если есть."""
     parts = [
         "📦 <b>Уведомление о заявке</b>",
         f"🧾 <b>Заявка:</b> {esc(item['request'])}" if item["request"] else "",
@@ -171,18 +149,18 @@ def _fmt_card(item: Dict[str, Any]) -> str:
         f"🚛 <b>ТК:</b> {esc(item['tk'])}" if item["tk"] else "",
         f"📄 <b>№ ТТН:</b> {esc(item['ttn'])}" if item["ttn"] else "",
         f"👤 <b>Заявитель:</b> {esc(item['applicant'])}" if item["applicant"] else "",
+        # НОВОЕ: комментарий, только если не пустой
+        f"📝 <b>Комментарий:</b> {esc(item['comment'])}" if item["comment"] else "",
     ]
     return "\n".join([p for p in parts if p])
-
 
 def _paginate(items: List[Dict[str, Any]], limit: int = 10) -> List[List[Dict[str, Any]]]:
     if limit <= 0:
         limit = 10
     pages = []
     for i in range(0, len(items), limit):
-        pages.append(items[i:i+limit])
+        pages.append(items[i:i + limit])
     return pages
-
 
 def _reply_list(chat_id: int, title: str, items: List[Dict[str, Any]], limit: int = 6):
     if not items:
@@ -194,7 +172,6 @@ def _reply_list(chat_id: int, title: str, items: List[Dict[str, Any]], limit: in
         body = "\n\n".join(_fmt_card(x) for x in page)
         tg_send_message(chat_id, f"{header}\n\n{body}")
 
-
 # ====== HELP ======
 def get_help_text() -> str:
     return (
@@ -203,7 +180,7 @@ def get_help_text() -> str:
         "• /help — список доступных команд\n"
         "• /id — показать ваш Telegram ID\n\n"
         "👤 <b>Личные запросы</b>\n"
-        "• /my — показать ваши заявки (по «Заявитель» или «Исполнитель»)\n"
+        "• /my — показать ваши заявки (по «Заявитель»/«Исполнитель»)\n"
         "• /status &lt;статус&gt; — заявки по статусу (напр.: /status В пути)\n"
         "• /today — отгрузки сегодня\n"
         "• /week — отгрузки на этой неделе\n"
@@ -213,25 +190,22 @@ def get_help_text() -> str:
         "ℹ️ В группе пишите команду отдельным сообщением. Если включена privacy, используйте @имябота: /help@ИмяБота"
     )
 
-
-# ====== Обработка команд ======
+# ====== Команды ======
 def handle_command(text: str, chat_id: int, from_user: dict, bot_username: str):
-    # отделим /cmd от аргументов
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
     args = parts[1] if len(parts) > 1 else ""
 
-    # если команда прислана как /help@BotName — оставим только /help, но проверим имя
     if '@' in cmd:
         base, at = cmd.split('@', 1)
         if at.lower() != bot_username.lower():
-            return  # это не наш бот
+            return
         cmd = base
 
     user_id = from_user.get("id")
     user_name = from_user.get("first_name", "")
 
-    data = None  # будем лениво загружать CSV по требованию
+    data = None
 
     def ensure_data():
         nonlocal data
@@ -253,22 +227,17 @@ def handle_command(text: str, chat_id: int, from_user: dict, bot_username: str):
 
     if cmd == "/my":
         rows = ensure_data()
-        # «Моими» считаем строки, где поле «Заявитель» или «Исполнитель» содержит имя/username
-        # Логика примитивная, при необходимости уточним.
-        query_tokens = []
+        tokens = []
         if from_user.get("username"):
-            query_tokens.append(from_user["username"])
+            tokens.append(from_user["username"])
         if user_name:
-            query_tokens.append(user_name)
+            tokens.append(user_name)
 
-        def _belongs(r):
+        def belongs(r):
             who = (r["applicant"] or "").lower()
-            for t in query_tokens:
-                if t and t.lower() in who:
-                    return True
-            return False
+            return any(t and t.lower() in who for t in tokens)
 
-        items = [r for r in rows if _belongs(r)]
+        items = [r for r in rows if belongs(r)]
         _reply_list(chat_id, "Ваши заявки", items)
         return
 
@@ -316,40 +285,30 @@ def handle_command(text: str, chat_id: int, from_user: dict, bot_username: str):
         return
 
     if cmd == "/last":
-        # Без полноценного «updated_at» в CSV покажем последние N строк как «новые/обновлённые».
         rows = ensure_data()
         items = rows[-10:] if len(rows) > 10 else rows
         _reply_list(chat_id, "Последние обновления", items)
         return
 
-    # Неизвестная команда — кинем подсказку
     tg_send_message(chat_id, "Не понимаю команду. Напишите /help")
 
-
-# ====== Роуты сервера ======
-
+# ====== Роуты ======
 @app.get("/")
 def root():
     return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify (reserved)", "/docs"]}
-
 
 @app.get("/health")
 def health():
     return {"ok": True, "service": "snab-bot", "webhook": "/tg"}
 
-
 @app.get("/tg")
 def tg_probe():
     return {"ok": True, "route": "/tg"}
 
-
 @app.post("/tg")
 async def tg_webhook(req: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    """
-    Вебхук Telegram. Если в BotFather задан Secret Token — можно сверять с WEBHOOK_SECRET.
-    """
     if WEBHOOK_SECRET:
-        # Если вы включили секрет в BotFather — раскомментируйте проверку:
+        # Если настроите secret в BotFather — включите проверку:
         # if (x_telegram_bot_api_secret_token or "") != WEBHOOK_SECRET:
         #     raise HTTPException(status_code=403, detail="Invalid webhook secret")
         pass
@@ -362,7 +321,7 @@ async def tg_webhook(req: Request, x_telegram_bot_api_secret_token: Optional[str
     except Exception:
         raise HTTPException(status_code=400, detail="Bad JSON")
 
-    # Определим имя бота (для /help@ИмяБота и т.п.)
+    # имя бота (для /help@ИмяБота)
     bot_username = ""
     try:
         me = requests.get(f"{TG_API}/getMe", timeout=10).json()
@@ -377,29 +336,23 @@ async def tg_webhook(req: Request, x_telegram_bot_api_secret_token: Optional[str
     chat_id = chat.get("id")
     from_user = message.get("from") or {}
 
-    # Реагируем только на команды (начинаются с /)
     if text.startswith("/"):
         handle_command(text, chat_id, from_user, bot_username)
-    else:
-        # Игнор прочих сообщений, чтобы не мусорить чат
-        pass
 
     return JSONResponse({"ok": True})
 
-
-# ====== (опционально) тестовая отправка из кода ======
+# ====== Тестовая отправка ======
 @app.post("/notify")
 def notify_example():
     if not CHAT_ID:
         return {"ok": False, "error": "CHAT_ID is empty"}
-    # Пример карточки «как у уведомлений из таблицы»
     msg = (
         "📦 <b>Уведомление о заявке</b>\n"
         "🧾 <b>Заявка:</b> Пример\n"
         "⭐ <b>Приоритет:</b> Аварийно\n"
         "🚚 <b>Статус:</b> В пути\n"
         "📅 <b>Дата отгрузки:</b> 13 октября 2025\n"
+        "📝 <b>Комментарий:</b> Пример комментария\n"
         "👤 <b>Заявитель:</b> Иванов И.И."
     )
-    res = tg_send_message(CHAT_ID, msg)
-    return res
+    return tg_send_message(CHAT_ID, msg)
