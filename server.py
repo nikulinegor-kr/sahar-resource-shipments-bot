@@ -1,49 +1,79 @@
-# server.py
-import os, html, requests
-from fastapi import FastAPI, Request, Header, HTTPException
+import os, json, re, html, requests
 from typing import Optional, Dict, Any
 
+from fastapi import FastAPI, Request, Header, HTTPException
+from pydantic import BaseModel
+
+# ========= ENV =========
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID          = os.getenv("CHAT_ID", "").strip()
 WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "").strip()
-SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL", "").strip()
-SHEET_API_KEY    = os.getenv("SHEET_API_KEY", "").strip()
-BOT_USERNAME     = os.getenv("BOT_USERNAME", "").strip()
+
+# куда постим при нажатии кнопки
+SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL", "").strip()  # Web App URL из Apps Script
+SHEET_API_KEY    = os.getenv("SHEET_API_KEY", "").strip()     # тот же ключ, что CFG.API_KEY в скрипте
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-app = FastAPI(title="Snab Notify Bot", version="1.3.1")
+app = FastAPI(title="Snab Notify Bot", version="1.3.0")
 
-def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+
+# ========= MODELS =========
+class OrderPayload(BaseModel):
+    order_id: Optional[str] = None
+    recipient: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None
+    ship_date: Optional[str] = None
+    arrival: Optional[str] = None
+    carrier: Optional[str] = None
+    ttn: Optional[str] = None
+    applicant: Optional[str] = None
+    comment: Optional[str] = None
+    # можно расширить при необходимости
+
+
+# ========= TG helpers =========
+def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TG_API}/{method}"
     r = requests.post(url, json=payload, timeout=15)
     try:
         return r.json()
     except Exception:
-        return {"ok": False, "status": r.status_code, "text": r.text}
+        return {"ok": False, "error": r.text}
 
-def tg_send(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def tg_send_message(text: str, reply_markup: Optional[Dict]=None, parse_mode: str="HTML") -> Dict[str, Any]:
+    if not BOT_TOKEN or not CHAT_ID:
+        return {"ok": False, "error": "BOT_TOKEN or CHAT_ID missing"}
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    return tg_call("sendMessage", payload)
+    return tg_request("sendMessage", payload)
 
-def tg_edit_reply_markup(chat_id: str, message_id: int, reply_markup: Optional[Dict[str, Any]]):
-    return tg_call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup})
+def tg_edit_reply_markup(chat_id: str, message_id: int, reply_markup: Optional[Dict]) -> Dict[str, Any]:
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": reply_markup or {"inline_keyboard": []}
+    }
+    return tg_request("editMessageReplyMarkup", payload)
 
-def tg_answer_cbq(cbq_id: str, text: str, show_alert: bool = False):
-    return tg_call("answerCallbackQuery", {"callback_query_id": cbq_id, "text": text, "show_alert": show_alert})
+def tg_answer_callback(cb_id: str, text: str="", show_alert: bool=False):
+    return tg_request("answerCallbackQuery", {"callback_query_id": cb_id, "text": text, "show_alert": show_alert})
 
-def render_text(data: Dict[str, Any]) -> str:
+
+# ========= Message formatting =========
+def format_order_text(data: Dict[str, Any]) -> str:
     g = lambda k: (data.get(k) or "").strip()
     lines = ["📦 Уведомление о заявке"]
     order = g("order_id") or "—"
     lines.append(f"🧾 Заявка: {html.escape(order)}")
+
     if g("priority"):   lines.append(f"⭐ Приоритет: {html.escape(g('priority'))}")
     if g("status"):     lines.append(f"🚚 Статус: {html.escape(g('status'))}")
     if g("carrier"):    lines.append(f"🚛 ТК: {html.escape(g('carrier'))}")
@@ -54,27 +84,65 @@ def render_text(data: Dict[str, Any]) -> str:
     if g("comment"):    lines.append(f"📝 Комментарий: {html.escape(g('comment'))}")
     return "\n".join(lines)
 
-def needs_button(status: str) -> bool:
-    return (status or "").strip().lower() == "доставлено в тк"
+def _norm(s: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
+def should_show_received_button(status: Optional[str]) -> bool:
+    """Показываем кнопку только при статусе 'Доставлено в ТК' (учитываем варианты написаний)."""
+    st = _norm(status)
+    candidates = {
+        "доставлено в тк",
+        "доставлено в т к",
+        "доставлено в т.к.",
+        "в тк доставлено",
+    }
+    return st in candidates
+
+def build_received_keyboard(order_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Делает инлайн-клавиатуру с одной кнопкой.
+    callback_data — JSON, бот обрабатывает тип 'rcv' (received).
+    """
+    data = {"t": "rcv"}
+    if order_id:
+        data["order_id"] = order_id
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ ТМЦ ПОЛУЧЕНО", "callback_data": json.dumps(data, ensure_ascii=False)}
+        ]]
+    }
+
+def build_received_done_keyboard() -> Dict[str, Any]:
+    """Неактивная версия: оставляем кнопку, но с типом 'done' — бот отвечает 'уже отмечено'."""
+    data = {"t": "done"}
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ ТМЦ ПОЛУЧЕНО", "callback_data": json.dumps(data, ensure_ascii=False)}
+        ]]
+    }
+
+
+# ========= Service routes =========
 @app.get("/")
 def root():
     return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "snab-bot", "webhook": "/tg"}
+    has_cfg = bool(SHEET_SCRIPT_URL and SHEET_API_KEY)
+    return {"ok": True, "service": "snab-bot", "webhook": "/tg", "sheet_cfg": has_cfg}
 
 @app.get("/tg")
 def tg_get():
     return {"ok": True, "route": "/tg"}
 
+# =========== Receive notifications from Apps Script and post to Telegram ===========
 @app.post("/notify")
 async def notify(req: Request, authorization: Optional[str] = Header(None)):
+    # simple bearer check so постить сюда может только Apps Script
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization header")
-    token = authorization.split("Bearer ", 1)[-1].strip()
-    if token != WEBHOOK_SECRET:
+    if authorization.split(" ", 1)[1].strip() != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
@@ -82,82 +150,105 @@ async def notify(req: Request, authorization: Optional[str] = Header(None)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    text = render_text(data)
-    kb = None
-    row_index = data.get("row_index")
-    status = (data.get("status") or "")
-    if row_index and needs_button(status):
-        kb = {"inline_keyboard": [[
-            {"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"rcv:{int(row_index)}"}
-        ]]}
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Body must be JSON object")
 
-    res = tg_send(text, reply_markup=kb)
-    if not res.get("ok"):
-        raise HTTPException(status_code=502, detail=f"Telegram error: {res}")
-    return {"ok": True, "sent": True}
+    text = format_order_text(data)
 
+    # решаем — показывать ли кнопку
+    markup = None
+    if should_show_received_button(data.get("status")):
+        markup = build_received_keyboard(data.get("order_id"))
+
+    res = tg_send_message(text, reply_markup=markup)
+    return {"ok": True, "telegram_response": res, "with_button": bool(markup)}
+
+
+# =========== Telegram webhook: commands + button clicks ===========
 @app.post("/tg")
-async def tg_webhook(req: Request):
+async def telegram_webhook(req: Request):
     update = await req.json()
+    # print("TG webhook:", json.dumps(update, ensure_ascii=False))
 
-    # Кнопки
-    if "callback_query" in update:
-        cbq = update["callback_query"]
-        data = cbq.get("data") or ""
-        cbq_id = cbq.get("id")
-        msg = cbq.get("message") or {}
-        chat_id = str(msg.get("chat", {}).get("id") or CHAT_ID)
-        message_id = msg.get("message_id")
+    # Команды
+    if "message" in update and update["message"].get("text"):
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        text = msg["text"].strip()
+        user = msg.get("from", {})
 
-        if data.startswith("rcv:"):
-            try:
-                row = int(data.split("rcv:",1)[1])
-            except Exception:
-                tg_answer_cbq(cbq_id, "Ошибка: некорректные данные.")
-                return {"ok": True}
+        if text.startswith("/start"):
+            reply = ("Привет! Я бот снабжения.\n"
+                     "Команды: /help — список команд, /id — показать ваш Telegram ID")
+            return tg_request("sendMessage", {"chat_id": chat_id, "text": reply})
 
-            if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
-                tg_answer_cbq(cbq_id, "Ошибка конфигурации сервера (нет URL/KEY).")
-                return {"ok": True}
+        if text.startswith("/help"):
+            reply = ("Доступные команды:\n"
+                     "/start — начать\n"
+                     "/help — список команд\n"
+                     "/id — показать ваш Telegram ID")
+            return tg_request("sendMessage", {"chat_id": chat_id, "text": reply})
 
-            # дергаем Apps Script
-            try:
-                r = requests.post(
-                    SHEET_SCRIPT_URL,
-                    json={"apiKey": SHEET_API_KEY, "action": "set_received", "row": row},
-                    timeout=15
-                )
-                # попытаемся прочитать JSON и показать подробности
-                ok = False
-                err_text = f"http {r.status_code}"
-                try:
-                    j = r.json()
-                    ok = bool(j.get("ok"))
-                    if not ok:
-                        err_text = j.get("error") or err_text
-                except Exception:
-                    err_text = r.text or err_text
-            except Exception as e:
-                ok = False
-                err_text = str(e)
+        if text.startswith("/id"):
+            uname = "@" + user.get("username") if user.get("username") else f"{user.get('first_name','')}".strip()
+            reply = f"Ваш ID: <b>{user.get('id')}</b>\nПользователь: {html.escape(uname)}"
+            return tg_request("sendMessage", {"chat_id": chat_id, "text": reply, "parse_mode":"HTML"})
 
-            if ok:
-                tg_answer_cbq(cbq_id, "Статус обновлён: Доставлено.")
-                if chat_id and message_id:
-                    tg_edit_reply_markup(chat_id, message_id, reply_markup={})  # отключаем кнопку
-            else:
-                tg_answer_cbq(cbq_id, f"Не удалось обновить статус: {err_text}", show_alert=True)
-
-        else:
-            tg_answer_cbq(cbq_id, "Неизвестная команда.")
+        # игнор прочего
         return {"ok": True}
 
-    # Базовые команды (минимум)
-    msg = update.get("message") or update.get("channel_post") or {}
-    text = (msg.get("text") or "").strip()
-    low  = text.lower()
-    if low in ("/start", f"/start@{BOT_USERNAME.lower()}" if BOT_USERNAME else "/start"):
-        tg_send("Привет! Я бот уведомлений по заявкам. Команды: /today /week /my /priority /help")
-    elif low in ("/help", f"/help@{BOT_USERNAME.lower()}" if BOT_USERNAME else "/help"):
-        tg_send("Доступные команды:\n/today – отгрузки/прибытия сегодня\n/week – за 7 дней\n/my – мои заявки\n/priority – аварийные")
+    # Клики по инлайн-кнопкам
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        cb_id = cb["id"]
+        msg = cb["message"]
+        chat_id = msg["chat"]["id"]
+        message_id = msg["message_id"]
+
+        try:
+            payload = json.loads(cb.get("data") or "{}")
+        except Exception:
+            payload = {}
+
+        typ = payload.get("t")
+
+        # кнопка уже отключена — просто сообщим
+        if typ == "done":
+            tg_answer_callback(cb_id, "Уже отмечено ✅")
+            return {"ok": True}
+
+        # основная кнопка «ТМЦ ПОЛУЧЕНО»
+        if typ == "rcv":
+            if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
+                tg_answer_callback(cb_id, "Ошибка конфигурации (нет SHEET_SCRIPT_URL/SHEET_API_KEY)", True)
+                return {"ok": False, "err": "no sheet cfg"}
+
+            order_id = payload.get("order_id", "")
+
+            # шлём в Apps Script (он теперь умеет и без order_id, но лучше передавать если есть)
+            body = {
+                "api_key":   SHEET_API_KEY,
+                "action":    "received",
+                "order_id":  order_id,
+                "new_status": "Доставлено",
+            }
+            try:
+                r = requests.post(SHEET_SCRIPT_URL, json=body, timeout=20)
+                ok = r.status_code == 200 and (r.json().get("ok") is True)
+            except Exception as e:
+                ok = False
+
+            if not ok:
+                tg_answer_callback(cb_id, "Не удалось обновить статус", True)
+                return {"ok": False}
+
+            # успех: отвечаем, и меняем клавиатуру на «неактивную»
+            tg_answer_callback(cb_id, "Статус обновлён: Доставлено ✅")
+            tg_edit_reply_markup(str(chat_id), int(message_id), build_received_done_keyboard())
+            return {"ok": True}
+
+        # неизвестный тип
+        tg_answer_callback(cb_id, "Неизвестное действие", False)
+        return {"ok": False, "err": "unknown cb type"}
+
     return {"ok": True}
