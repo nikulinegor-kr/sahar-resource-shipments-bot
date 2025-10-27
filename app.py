@@ -1,3 +1,66 @@
+# --- вверху файла ---
+from fastapi import BackgroundTasks
+import traceback
+import time
+
+# ...
+
+def _safe_tg_send(text: str):
+    """Фоновая отправка в Telegram с защитой от исключений и таймаутом."""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[tg] skip: no BOT_TOKEN/CHAT_ID")
+        return
+    try:
+        r = requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=8,  # короткий таймаут, чтобы не вешать воркер
+        )
+        try:
+            print("[tg] response:", r.status_code, r.text[:500])
+        except Exception:
+            pass
+    except Exception as e:
+        print("[tg] error:", repr(e))
+        traceback.print_exc()
+
+@app.post("/notify")
+async def notify(
+    req: Request,
+    background: BackgroundTasks,
+    authorization: Optional[str] = Header(None)
+):
+    t0 = time.time()
+    # Авторизация
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token = authorization.split("Bearer ", 1)[-1].strip()
+    if token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    # Читаем JSON
+    try:
+        data = await req.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON is not an object")
+    except Exception as e:
+        print("[/notify] bad JSON:", repr(e))
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Формируем текст
+    try:
+        msg_text = format_order_text(data)
+    except Exception as e:
+        print("[/notify] format error:", repr(e))
+        traceback.print_exc()
+        msg_text = "📦 Уведомление"
+
+    # Главное: отвечаем КЛИЕНТУ сразу,
+    # а отправку в TG переносим в фоновую задачу.
+    background.add_task(_safe_tg_send, msg_text)
+
+    dt = round((time.time() - t0) * 1000)
+    return {"ok": True, "queued": True, "elapsed_ms": dt}
 # app.py
 import os, html, requests
 from typing import Optional, List, Dict, Any
