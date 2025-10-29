@@ -1,180 +1,143 @@
+import os, html, re, requests
 from fastapi import FastAPI, Request, Header, HTTPException
 from typing import Optional, Dict, Any
-import requests
-from threading import Thread
-import os
-
-app = FastAPI()
 
 # ===== НАСТРОЙКИ =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL")
-SHEET_API_KEY = os.getenv("SHEET_API_KEY")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID          = os.getenv("CHAT_ID", "").strip()              # ID TG-группы, формат -100...
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "").strip()       # тот же токен, что и в Google Script
+SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL", "").strip()     # URL Web App из Apps Script
+TG_API           = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+app = FastAPI(title="Snab Orders Bot")
 
-pending_comments = {}  # сюда сохраняем заявки "на доработку"
+# ===== ВРЕМЕННОЕ ХРАНИЛИЩЕ =====
+WAITING_COMMENT: Dict[int, str] = {}  # user_id -> order_id
 
+# ===== УТИЛИТЫ =====
+def tg(method: str, data: Dict[str, Any]):
+    try:
+        r = requests.post(f"{TG_API}/{method}", json=data, timeout=15)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-# ======= УТИЛИТЫ =======
-
-def tg_send_message(text: str, reply_markup: Optional[Dict] = None, parse_mode="HTML"):
-    """Отправка сообщения в Telegram"""
-    if not BOT_TOKEN or not CHAT_ID:
-        print("⚠️ BOT_TOKEN or CHAT_ID missing")
-        return
-
+def tg_message(text, buttons=None):
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+    return tg("sendMessage", payload)
 
+def sheet_update(payload):
+    if not SHEET_SCRIPT_URL:
+        return {"ok": False, "error": "SHEET_SCRIPT_URL not set"}
     try:
-        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=8)
+        r = requests.post(SHEET_SCRIPT_URL, json=payload, timeout=15)
+        return r.json()
     except Exception as e:
-        print("tg_send_message error:", e)
+        return {"ok": False, "error": str(e)}
 
+def normalize(s): return re.sub(r"\s+", " ", s.lower().replace("\u00a0", " ")).strip()
 
-def update_sheet_status(order_id: str, new_status: str):
-    """Отправляем в Google Apps Script обновление статуса"""
-    if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
-        print("⚠️ SHEET_SCRIPT_URL or SHEET_API_KEY missing")
-        return
+# ====== ВСПОМОГАТЕЛЬНЫЕ ======
+def render(data):
+    g = lambda k: html.escape(str(data.get(k, "") or ""))
+    msg = f"""📦 <b>Уведомление о заявке</b>
+🧾 <b>Заявка:</b> {g('order_id')}
+⭐ <b>Приоритет:</b> {g('priority')}
+🚚 <b>Статус:</b> {g('status')}
+👤 <b>Заявитель:</b> {g('applicant')}
+📝 <b>Комментарий:</b> {g('comment')}
+"""
+    return msg
 
-    try:
-        res = requests.post(
-            SHEET_SCRIPT_URL,
-            headers={"Authorization": f"Bearer {SHEET_API_KEY}"},
-            json={"action": "update_status", "order_id": order_id, "new_status": new_status},
-            timeout=10,
-        )
-        print("Sheet update:", res.status_code, res.text)
-    except Exception as e:
-        print("update_sheet_status error:", e)
+def build_keyboard(data):
+    rows = []
+    st = normalize(data.get("status", ""))
+    cm = normalize(data.get("comment", ""))
+    order = data.get("order_id")
 
+    if "доставлено" in st and "тк" in st:
+        rows.append([{"text": "✅ ТМЦ ПОЛУЧЕНО", "callback_data": f"recv|{order}"}])
 
-def build_keyboard(comment: str, order_id: str):
-    """Выбираем клавиатуру по типу комментария"""
-    c = comment.lower().strip()
-    if "требуется согласование" in c:
-        return {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ В РАБОТУ", "callback_data": f"approve|{order_id}"},
-                    {"text": "🔧 НА ДОРАБОТКУ", "callback_data": f"revise|{order_id}"},
-                    {"text": "❌ ОТКЛОНЕНО", "callback_data": f"reject|{order_id}"},
-                ]
-            ]
-        }
-    elif "доставлено в тк" in c:
-        return {
-            "inline_keyboard": [
-                [{"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}]
-            ]
-        }
-    else:
-        return None
+    if "требуется согласование" in cm:
+        rows.append([{"text": "🟩 В РАБОТУ: СОГЛАСОВАНО", "callback_data": f"approve|{order}"}])
+        rows.append([
+            {"text": "🟨 На доработку", "callback_data": f"revise|{order}"},
+            {"text": "🟥 ОТКЛОНЕНО", "callback_data": f"reject|{order}"}
+        ])
+    return rows or None
 
-
-# ======= /notify (из Google Apps Script) =======
+# ====== API ======
+@app.get("/health")
+def health(): return {"ok": True}
 
 @app.post("/notify")
 async def notify(req: Request, authorization: Optional[str] = Header(None)):
-    if authorization != f"Bearer {WEBHOOK_SECRET}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not authorization or authorization.replace("Bearer ", "").strip() != WEBHOOK_SECRET:
+        raise HTTPException(401, "Unauthorized")
 
     data = await req.json()
-    order_id = data.get("order_id")
-    comment = data.get("comment", "")
-    status = data.get("status", "")
-
-    msg = (
-        f"📦 <b>Уведомление о заявке</b>\n"
-        f"🧾 <b>Заявка:</b> {order_id}\n"
-        f"⭐ <b>Статус:</b> {status}\n"
-        f"📝 <b>Комментарий:</b> {comment}"
-    )
-
-    keyboard = build_keyboard(comment, order_id)
-
-    Thread(target=lambda: tg_send_message(msg, reply_markup=keyboard)).start()
+    text = render(data)
+    keyboard = build_keyboard(data)
+    tg_message(text, keyboard)
     return {"ok": True}
-
-
-# ======= /tg — обработчик нажатий =======
 
 @app.post("/tg")
 async def tg_webhook(req: Request):
-    update = await req.json()
-    print("TG update:", update)
+    upd = await req.json()
+    print("TG update:", upd)
 
-    if "callback_query" in update:
-        cq = update["callback_query"]
-        data = cq.get("data", "")
+    # ==== CALLBACK-КНОПКИ ====
+    if "callback_query" in upd:
+        cq = upd["callback_query"]
         user = cq.get("from", {})
         user_id = user.get("id")
-        chat_id = cq["message"]["chat"]["id"]
+        data = cq.get("data", "")
+        msg = cq["message"]
+        cid, mid = msg["chat"]["id"], msg["message_id"]
 
-        parts = data.split("|")
-        if len(parts) != 2:
-            return {"ok": False}
+        def answer(text): tg("answerCallbackQuery", {"callback_query_id": cq["id"], "text": text})
 
-        action, order_id = parts
+        if "|" in data:
+            act, order = data.split("|", 1)
+            if act == "recv":
+                sheet_update({"action": "status", "order_id": order, "new_status": "Доставлено"})
+                tg("editMessageReplyMarkup", {"chat_id": cid, "message_id": mid,
+                                              "reply_markup": {"inline_keyboard": [[{"text": "✅ Отмечено", "callback_data": "noop"}]]}})
+                return answer("Отмечено")
 
-        if action == "approve":
-            new_status = "В РАБОТУ: СОГЛАСОВАНО"
-            msg = f"✅ Заявка <b>{order_id}</b> согласована и принята в работу."
-            update_sheet_status(order_id, new_status)
-            tg_send_message(msg)
+            if act == "approve":
+                sheet_update({"action": "status", "order_id": order, "new_status": "В РАБОТУ: СОГЛАСОВАНО"})
+                tg("editMessageReplyMarkup", {"chat_id": cid, "message_id": mid,
+                                              "reply_markup": {"inline_keyboard": [[{"text": "🟩 Согласовано", "callback_data": "noop"}]]}})
+                return answer("Согласовано")
 
-        elif action == "reject":
-            new_status = "ОТКЛОНЕНО"
-            msg = f"❌ Заявка <b>{order_id}</b> отклонена."
-            update_sheet_status(order_id, new_status)
-            tg_send_message(msg)
+            if act == "reject":
+                sheet_update({"action": "status", "order_id": order, "new_status": "ОТКЛОНЕНО"})
+                tg("editMessageReplyMarkup", {"chat_id": cid, "message_id": mid,
+                                              "reply_markup": {"inline_keyboard": [[{"text": "🟥 Отклонено", "callback_data": "noop"}]]}})
+                return answer("Отклонено")
 
-        elif action == "revise":
-            pending_comments[user_id] = order_id
-            tg_send_message(
-                f"🔧 Для заявки <b>{order_id}</b> требуется уточнение.\n"
-                f"Пожалуйста, ответьте сюда сообщением — ваш комментарий будет добавлен в таблицу."
-            )
+            if act == "revise":
+                WAITING_COMMENT[user_id] = order
+                tg_message(f"🟨 Введите комментарий для заявки <b>{order}</b>")
+                return answer("Введите комментарий")
 
-        elif action == "received":
-            new_status = "ТМЦ ПОЛУЧЕНО"
-            msg = f"📦 Заявка <b>{order_id}</b> отмечена как полученная."
-            update_sheet_status(order_id, new_status)
-            tg_send_message(msg)
-
-        return {"ok": True}
-
-    # === пользователь отвечает сообщением (доработка) ===
-    if "message" in update:
-        msg = update["message"]
-        user = msg.get("from", {})
-        user_id = user.get("id")
+    # ==== СООБЩЕНИЕ ОТ ПОЛЬЗОВАТЕЛЯ ====
+    if "message" in upd:
+        msg = upd["message"]
+        user_id = msg["from"]["id"]
         text = msg.get("text", "").strip()
+        if user_id in WAITING_COMMENT:
+            order = WAITING_COMMENT.pop(user_id)
+            sheet_update({"action": "status_with_comment", "order_id": order,
+                          "new_status": "На доработку", "comment": text})
+            tg_message(f"🟨 Заявка <b>{order}</b> отправлена на доработку.\nКомментарий: {html.escape(text)}")
 
-        if user_id in pending_comments:
-            order_id = pending_comments.pop(user_id)
-            new_status = f"На доработку: {text}"
-            update_sheet_status(order_id, new_status)
-            tg_send_message(
-                f"🔧 Заявка <b>{order_id}</b> отправлена на доработку с комментарием:\n{text}"
-            )
-
-        return {"ok": True}
-
-    return {"ok": False}
-
-
-# ======= HEALTH =======
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    return {"ok": True}
