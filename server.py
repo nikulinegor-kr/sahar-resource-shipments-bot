@@ -148,6 +148,9 @@ async def tg_webhook(req: Request):
         data = cq.get("data", "")
         user = cq.get("from", {})
         user_id = user.get("id")
+        first_name = user.get("first_name", "")
+        last_name = user.get("last_name", "")
+        user_name = (first_name + " " + last_name).strip() or f"ID:{user_id}"
         chat_id = cq["message"]["chat"]["id"]
 
         parts = data.split("|", 1)
@@ -156,33 +159,60 @@ async def tg_webhook(req: Request):
 
         action, order_id = parts
 
+        # ✅ В РАБОТУ
         if action == "approve":
             new_status = "В РАБОТУ: СОГЛАСОВАНО"
-            msg = f"✅ Заявка <b>{order_id}</b> согласована и принята в работу."
+            msg = f"✅ Заявка <b>{order_id}</b> согласована и принята в работу.\n👤 Исполнитель: <b>{html.escape(user_name)}</b>"
             update_sheet_status(order_id, new_status)
             tg_send_message(msg)
 
+        # ❌ ОТКЛОНЕНО
         elif action == "reject":
             new_status = "ОТКЛОНЕНО"
-            msg = f"❌ Заявка <b>{order_id}</b> отклонена."
+            msg = f"❌ Заявка <b>{order_id}</b> отклонена.\n👤 Исполнитель: <b>{html.escape(user_name)}</b>"
             update_sheet_status(order_id, new_status)
             tg_send_message(msg)
 
+        # 🔧 НА ДОРАБОТКУ
         elif action == "revise":
             pending_comments[user_id] = order_id
             tg_send_message(
                 f"🔧 Для заявки <b>{order_id}</b> требуется уточнение.\n"
-                f"Пожалуйста, ответьте сюда сообщением — ваш комментарий будет добавлен в таблицу."
+                f"Пожалуйста, ответьте сюда сообщением — ваш комментарий будет добавлен в таблицу.\n"
+                f"👤 Исполнитель: <b>{html.escape(user_name)}</b>"
             )
 
+        # 📦 ТМЦ ПОЛУЧЕНО
         elif action == "received":
             new_status = "ТМЦ ПОЛУЧЕНО"
-            msg = f"📦 Заявка <b>{order_id}</b> отмечена как полученная."
+            msg = f"📦 Заявка <b>{order_id}</b> отмечена как полученная.\n👤 Ответственный: <b>{html.escape(user_name)}</b>"
             update_sheet_status(order_id, new_status)
             tg_send_message(msg)
 
         return {"ok": True}
 
+    # === пользователь отвечает сообщением (доработка) ===
+    if "message" in update:
+        msg = update["message"]
+        user = msg.get("from", {})
+        user_id = user.get("id")
+        text = msg.get("text", "").strip()
+        first_name = user.get("first_name", "")
+        last_name = user.get("last_name", "")
+        user_name = (first_name + " " + last_name).strip() or f"ID:{user_id}"
+
+        if user_id in pending_comments:
+            order_id = pending_comments.pop(user_id)
+            new_status = f"На доработку: {text}"
+            update_sheet_status(order_id, new_status)
+            tg_send_message(
+                f"🔧 Заявка <b>{order_id}</b> отправлена на доработку с комментарием:\n"
+                f"{html.escape(text)}\n👤 Исполнитель: <b>{html.escape(user_name)}</b>"
+            )
+
+        return {"ok": True}
+
+    return {"ok": False}
     # === пользователь отвечает сообщением (доработка) ===
     if "message" in update:
         msg = update["message"]
