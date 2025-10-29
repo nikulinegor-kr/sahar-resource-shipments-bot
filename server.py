@@ -1,223 +1,127 @@
-# server.py
-import os, html, requests, re
-from typing import Optional, Dict, Any
+# app.py
+import os, html, requests
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Request, Header, HTTPException
+from pydantic import BaseModel, Field
 
-# === ENV ===
-BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID          = os.getenv("CHAT_ID", "").strip()                 # -1003141855190
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "").strip()          # sahar2025secure_longtoken
-SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL", "").strip()        # URL веб-приложения Apps Script (Anyone)
+app = FastAPI(title="Snab Bot & Notify", version="1.0.0")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()
+
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-app = FastAPI(title="Snab Notify Bot", version="1.3.0")
-
-
-# ====== УТИЛЫ ======
-def norm(s: Optional[str]) -> str:
-    if s is None: return ""
-    return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip().lower()
-
-def send_tg(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not BOT_TOKEN or not CHAT_ID:
-        return {"ok": False, "error": "BOT_TOKEN/CHAT_ID missing"}
-    r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=15)
+def tg_send_message(chat_id: str | int, text: str, parse_mode: str = "HTML") -> Dict[str, Any]:
+    if not BOT_TOKEN:
+        return {"ok": False, "error": "BOT_TOKEN is empty"}
+    r = requests.post(f"{TG_API}/sendMessage",
+                      json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
+                            "disable_web_page_preview": True}, timeout=15)
     try:
         return r.json()
     except Exception:
-        return {"ok": False, "error": r.text}
+        return {"ok": False, "status": r.status_code, "text": r.text}
 
-def edit_reply_markup(chat_id: str, message_id: int, reply_markup: Optional[Dict[str, Any]]):
-    url = f"{TG_API}/editMessageReplyMarkup"
-    data = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reply_markup": reply_markup
-    }
-    requests.post(url, json=data, timeout=10)
+def esc(s: Optional[str]) -> str:
+    return html.escape((s or "").strip())
 
-def answer_cbq(cbq_id: str, text: str, show_alert: bool=False):
-    requests.post(f"{TG_API}/answerCallbackQuery",
-                  json={"callback_query_id": cbq_id, "text": text, "show_alert": show_alert},
-                  timeout=10)
-
-def format_order_text(data: Dict[str, Any]) -> str:
-    g = lambda k: (data.get(k) or "").strip()
-    lines = ["📦 Уведомление о заявке"]
-    order = g("order_id") or "—"
-    lines.append(f"🧾 Заявка: {html.escape(order)}")
-    if g("priority"):   lines.append(f"⭐ Приоритет: {html.escape(g('priority'))}")
-    if g("status"):     lines.append(f"🚚 Статус: {html.escape(g('status'))}")
-    if g("carrier"):    lines.append(f"🚛 ТК: {html.escape(g('carrier'))}")
-    if g("ttn"):        lines.append(f"📄 № ТТН: {html.escape(g('ttn'))}")
-    if g("ship_date"):  lines.append(f"📅 Дата отгрузки: {html.escape(g('ship_date'))}")
-    if g("arrival"):    lines.append(f"📅 Дата прибытия: {html.escape(g('arrival'))}")
-    if g("applicant"):  lines.append(f"👤 Заявитель: {html.escape(g('applicant'))}")
-    if g("comment"):    lines.append(f"📝 Комментарий: {html.escape(g('comment'))}")
-    return "\n".join(lines)
-
-def need_btn_received(status_text: str) -> bool:
-    s = norm(status_text)
-    # ловим «доставлено в тк» с разными пробелами/точками
-    return bool(re.search(r"\bдоставлено\b", s) and re.search(r"\bв\s*т[.\s]*к\b", s))
-
-def need_btn_approve(comment_text: str) -> bool:
-    s = norm(comment_text)
-    return "требуется согласование" in s
-
-
-# ====== СЛУЖЕБНЫЕ РОУТЫ ======
+# ==== сервисные ====
 @app.get("/")
 def root():
-    return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify", "/docs"]}
+    return {"ok": True, "routes": ["/", "/health", "/tg (GET/POST)", "/notify"]}
 
 @app.get("/health")
 def health():
     return {"ok": True, "service": "snab-bot", "webhook": "/tg"}
 
 @app.get("/tg")
-def tg_get():
+def tg_get_probe():
     return {"ok": True, "route": "/tg"}
 
-
-# ====== ПРИЁМ ИЗ ТАБЛИЦЫ ======
-@app.post("/notify")
-async def notify(req: Request, authorization: Optional[str] = Header(None)):
-    # 1) авторизация
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    token = authorization.split("Bearer ")[-1].strip()
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    # 2) json
+# ==== telegram webhook ====
+@app.post("/tg")
+async def tg_webhook(req: Request):
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="BOT_TOKEN not configured")
     try:
-        data = await req.json()
-        assert isinstance(data, dict)
+        update = await req.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        update = {}
+    message = update.get("message") or update.get("channel_post")
+    if not message:
+        return {"ok": True, "skipped": True}
+    chat_id = (message.get("chat") or {}).get("id")
+    text = (message.get("text") or "").strip()
 
-    # 3) текст
-    text = format_order_text(data)
+    if text.startswith("/start"):
+        tg_send_message(chat_id, ("👋 <b>Бот снабжения</b> готов.\n\n"
+                                  "Команды:\n• /help — список команд\n• /id — ваш Telegram ID"))
+    elif text.startswith("/help"):
+        tg_send_message(chat_id, ("<b>Команды:</b>\n"
+                                  "• /start — начать работу\n"
+                                  "• /help — список команд\n"
+                                  "• /id — ваш Telegram ID\n\n"
+                                  "Внешние уведомления приходят на /notify."))
+    elif text.startswith("/id"):
+        user = message.get("from", {})
+        tg_send_message(chat_id, f"🆔 Ваш ID: <code>{user.get('id')}</code>\n"
+                                 f"👤 @{esc(user.get('username')) if user.get('username') else '—'}")
+    return {"ok": True}
 
-    # 4) клавиатура по условиям
-    kb: Optional[Dict[str, Any]] = None
-    buttons = []
+# ==== /notify ====
+class Responsible(BaseModel):
+    name: Optional[str] = None
+    username: Optional[str] = None
+    user_id: Optional[int] = None
 
-    if need_btn_received(data.get("status") or ""):
-        # кнопка «ТМЦ получено»
-        order_id = (data.get("order_id") or "").strip()
-        if order_id:
-            buttons.append([{"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"recv|{order_id}"}])
+class Item(BaseModel):
+    name: str
+    qty: Optional[float] = None
+    unit: Optional[str] = None
 
-    if need_btn_approve(data.get("comment") or ""):
-        order_id = (data.get("order_id") or "").strip()
-        if order_id:
-            buttons.append([{"text": "✅ В РАБОТУ • СОГЛАСОВАНО", "callback_data": f"appr|{order_id}"}])
+class NotifyPayload(BaseModel):
+    order_id: str = Field(..., description="Номер заявки")
+    recipient: str = Field(..., description="Получатель")
+    city: Optional[str] = None
+    phone: Optional[str] = None
+    ship_date: Optional[str] = None
+    arrival_date: Optional[str] = None
+    carrier: Optional[str] = None
+    ttn: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    applicant: Optional[str] = None
+    comment: Optional[str] = None
+    responsible: Optional[Responsible] = None
+    items: List[Item] = []
 
-    if buttons:
-        kb = {"inline_keyboard": buttons}
+def render_notify_message(p: NotifyPayload) -> str:
+    parts = ["📦 <b>Уведомление о заявке</b>"]
+    if p.order_id:     parts.append(f"\n🧾 <b>Заявка:</b> {esc(p.order_id)}")
+    if p.priority:     parts.append(f"\n⭐ <b>Приоритет:</b> {esc(p.priority)}")
+    if p.status:       parts.append(f"\n🚚 <b>Статус:</b> {esc(p.status)}")
+    if p.ship_date:    parts.append(f"\n📅 <b>Дата отгрузки:</b> {esc(p.ship_date)}")
+    if p.arrival_date: parts.append(f"\n📦 <b>Дата прибытия:</b> {esc(p.arrival_date)}")
+    if p.carrier:      parts.append(f"\n🚛 <b>ТК:</b> {esc(p.carrier)}")
+    if p.ttn:          parts.append(f"\n📄 <b>№ ТТН:</b> {esc(p.ttn)}")
+    if p.applicant:    parts.append(f"\n👤 <b>Заявитель:</b> {esc(p.applicant)}")
+    if p.responsible:
+        r = p.responsible
+        if r.username: parts.append(f"\n👤 <b>Ответственный:</b> @{esc(r.username)}")
+        elif r.user_id: parts.append(f"\n👤 <b>Ответственный:</b> tg://user?id={r.user_id}")
+        elif r.name: parts.append(f"\n👤 <b>Ответственный:</b> {esc(r.name)}")
+    return "".join(parts)
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    if kb:
-        payload["reply_markup"] = kb
-
-    res = send_tg(payload)
+@app.post("/notify")
+async def notify(payload: NotifyPayload, authorization: str = Header(default="")):
+    if WEBHOOK_SECRET and authorization != f"Bearer {WEBHOOK_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not CHAT_ID:
+        raise HTTPException(status_code=500, detail="CHAT_ID is empty")
+    msg = render_notify_message(payload)
+    res = tg_send_message(CHAT_ID, msg)
     if not res.get("ok"):
         raise HTTPException(status_code=502, detail=f"Telegram error: {res}")
-
-    return {"ok": True, "telegram_response": res}
-
-
-# ====== ВЕБХУК ОТ TELEGRAM (команды и клики по инлайн-кнопкам) ======
-@app.post("/tg")
-async def tg_post(req: Request):
-    upd = await req.json()
-    print("TG update:", upd)
-
-    # 1) команды / текст
-    msg = upd.get("message") or upd.get("channel_post")
-    if msg and isinstance(msg, dict):
-        text = (msg.get("text") or "").strip()
-        if text.startswith("/start") or text.startswith("/help"):
-            help_text = (
-                "Привет! Я бот снабжения.\n\n"
-                "Доступные команды:\n"
-                "/start — помощь\n"
-                "/help — помощь\n"
-                "(уведомления приходят автоматически из таблицы)"
-            )
-            requests.post(f"{TG_API}/sendMessage",
-                          json={"chat_id": msg["chat"]["id"], "text": help_text},
-                          timeout=10)
-            return {"ok": True}
-
-    # 2) callback_query (кнопки)
-    cbq = upd.get("callback_query")
-    if cbq and isinstance(cbq, dict):
-        cbq_id = cbq.get("id")
-        from_user = cbq.get("from", {})
-        msg_obj   = cbq.get("message", {})
-        data      = (cbq.get("data") or "").strip()
-        chat_id   = str(msg_obj.get("chat", {}).get("id"))
-        message_id = msg_obj.get("message_id")
-
-        # ожидаем форматы:
-        # recv|ORDER_ID   -> поставить "Доставлено"
-        # appr|ORDER_ID   -> поставить "В РАБОТУ: СОГЛАСОВАНО"
-        if "|" in data:
-            action, order_id = data.split("|", 1)
-            order_id = order_id.strip()
-
-            if action in ("recv", "appr") and order_id:
-                if not SHEET_SCRIPT_URL:
-                    answer_cbq(cbq_id, "Ошибка: не настроен SHEET_SCRIPT_URL", True)
-                    return {"ok": False}
-
-                new_status = "Доставлено" if action == "recv" else "В РАБОТУ: СОГЛАСОВАНО"
-                # POST в Apps Script
-                try:
-                    r = requests.post(
-                        SHEET_SCRIPT_URL,
-                        json={
-                            "secret": WEBHOOK_SECRET,
-                            "action": "set_status",
-                            "order_id": order_id,
-                            "status": new_status
-                        },
-                        timeout=15
-                    )
-                    ok = r.ok
-                    try:
-                        j = r.json()
-                        ok = ok and j.get("ok") is True
-                    except Exception:
-                        pass
-
-                    if ok:
-                        answer_cbq(cbq_id, "Статус обновлён ✅")
-                        # деактивируем кнопку (заменим на «зеленую» метку)
-                        if action == "recv":
-                            new_kb = {"inline_keyboard": [[{"text": "✅ Получено", "callback_data": "done"}]]}
-                        else:
-                            new_kb = {"inline_keyboard": [[{"text": "✅ Согласовано", "callback_data": "done"}]]}
-                        if chat_id and message_id:
-                            edit_reply_markup(chat_id, message_id, new_kb)
-                        return {"ok": True}
-                    else:
-                        answer_cbq(cbq_id, "Не удалось обновить статус", True)
-                        return {"ok": False}
-                except Exception as e:
-                    answer_cbq(cbq_id, f"Ошибка запроса: {e}", True)
-                    return {"ok": False}
-
-        # если что-то иное — просто ответим
-        answer_cbq(cbq_id, "Ок")
-        return {"ok": True}
-
-    return {"ok": True}
+    return {"ok": True, "sent_to": CHAT_ID}
