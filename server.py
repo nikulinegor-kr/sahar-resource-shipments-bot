@@ -1,33 +1,30 @@
+import os
+import html
+import requests
 from fastapi import FastAPI, Request, Header, HTTPException
 from typing import Optional, Dict, Any
-import requests
 from threading import Thread
-import os
-import re
-import html
 
-app = FastAPI()
+app = FastAPI(title="Snab Notify Bot", version="2.3.0")
 
-# ===== НАСТРОЙКИ =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL")
-SHEET_API_KEY = os.getenv("SHEET_API_KEY")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# ===== ENV (настрой в Koyeb) =====
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID          = os.getenv("CHAT_ID", "").strip()               # -100xxxxxxxxxx
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "").strip()        # должен совпадать с CFG.SECRET в Apps Script (для /notify)
+SHEET_SCRIPT_URL = os.getenv("SHEET_SCRIPT_URL", "").strip()      # URL веб-приложения Apps Script (Deploy → Web app → URL)
+SHEET_API_KEY    = os.getenv("SHEET_API_KEY", "").strip()         # ключ для doPost в Apps Script (совпадает с CFG.SECRET)
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-pending_comments: Dict[int, str] = {}  # кто оставляет комментарий для "На доработку"
+# Ждём комментарий для «На доработку»
+pending_comments: Dict[int, str] = {}  # {user_id: order_id}
 
 
-# ======= УТИЛИТЫ =======
-
-def tg_send_message(text: str, reply_markup: Optional[Dict] = None, parse_mode="HTML"):
-    """Отправка сообщения в Telegram"""
+# ======== Telegram helpers ========
+def tg_send_message(text: str, reply_markup: Optional[Dict] = None, parse_mode: str = "HTML"):
     if not BOT_TOKEN or not CHAT_ID:
         print("⚠️ BOT_TOKEN or CHAT_ID missing")
-        return
-
+        return {"ok": False, "error": "BOT_TOKEN/CHAT_ID missing"}
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -36,206 +33,231 @@ def tg_send_message(text: str, reply_markup: Optional[Dict] = None, parse_mode="
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-
     try:
-        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=8)
+        r = requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
+        return r.json()
     except Exception as e:
         print("tg_send_message error:", e)
+        return {"ok": False, "error": str(e)}
+
+def tg_answer_callback_query(callback_query_id: str, text: str = "", show_alert: bool = False):
+    if not BOT_TOKEN:
+        return
+    try:
+        requests.post(f"{TG_API}/answerCallbackQuery",
+                      json={"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert},
+                      timeout=8)
+    except Exception as e:
+        print("answerCallback error:", e)
+
+def tg_edit_reply_markup(chat_id: int, message_id: int):
+    """Удалить/отключить клавиатуру у исходного сообщения."""
+    if not BOT_TOKEN:
+        return
+    try:
+        requests.post(f"{TG_API}/editMessageReplyMarkup",
+                      json={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
+                      timeout=8)
+    except Exception as e:
+        print("editReplyMarkup error:", e)
+
+def user_display_name(u: Dict[str, Any]) -> str:
+    first = u.get("first_name") or ""
+    last  = u.get("last_name") or ""
+    full  = (first + " " + last).strip()
+    if full:
+        return full
+    return u.get("username") or str(u.get("id") or "user")
 
 
-def update_sheet_status(order_id: str, new_status: str):
-    """Отправляем в Google Apps Script обновление статуса"""
+# ======== Sheets helpers ========
+def update_sheet_status(order_id: str, new_status: str, comment: Optional[str] = None):
+    """
+    Обновляем статус (и опц. комментарий) в Google Sheets через Apps Script doPost.
+    Тело JSON:
+      {
+        "api_key": SHEET_API_KEY,   # обязателен
+        "action": "status" | "status_with_comment",
+        "order_id": "...",
+        "new_status": "...",
+        "comment": "..."            # опционально
+      }
+    """
     if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
         print("⚠️ SHEET_SCRIPT_URL or SHEET_API_KEY missing")
         return
 
+    payload = {
+        "api_key": SHEET_API_KEY,
+        "order_id": order_id,
+    }
+
+    if comment:
+        payload.update({"action": "status_with_comment", "new_status": new_status, "comment": comment})
+    else:
+        payload.update({"action": "status", "new_status": new_status})
+
     try:
-        res = requests.post(
-            SHEET_SCRIPT_URL,
-            headers={"Authorization": f"Bearer {SHEET_API_KEY}"},
-            json={"action": "update_status", "order_id": order_id, "new_status": new_status},
-            timeout=10,
-        )
+        res = requests.post(SHEET_SCRIPT_URL, json=payload, timeout=12)
         print("Sheet update:", res.status_code, res.text)
     except Exception as e:
         print("update_sheet_status error:", e)
 
 
-def _norm(s: str) -> str:
-    """Нормализуем строку: нижний регистр, NBSP -> пробел, схлопываем пробелы."""
-    return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ").lower()).strip()
-
-
-def _is_delivered_to_tk(status: str) -> bool:
-    """Проверяем разные варианты 'доставлено в тк' в статусе."""
-    n = _norm(status)
-    if not n:
-        return False
-    # прямое совпадение
-    if n == "доставлено в тк":
-        return True
-    # допуски: 'доставлено в т.к.' / двойные пробелы / знаки
-    return ("доставлено" in n) and (re.search(r"\bв\s*т\.?к\.?\b", n) is not None or " в тк" in n)
-
+# ======== Формат уведомления ========
+def format_order_text(data: Dict[str, Any]) -> str:
+    g = lambda k: (data.get(k) or "").strip()
+    lines = ["📦 <b>Уведомление о заявке</b>"]
+    lines.append(f"🧾 <b>Заявка:</b> {html.escape(g('order_id') or '—')}")
+    if g("priority"): lines.append(f"⭐ <b>Приоритет:</b> {html.escape(g('priority'))}")
+    if g("status"):   lines.append(f"🚚 <b>Статус:</b> {html.escape(g('status'))}")
+    if g("carrier"):  lines.append(f"🚛 <b>ТК:</b> {html.escape(g('carrier'))}")
+    if g("ttn"):      lines.append(f"📄 <b>№ ТТН:</b> {html.escape(g('ttn'))}")
+    if g("ship_date"):lines.append(f"📅 <b>Дата отгрузки:</b> {html.escape(g('ship_date'))}")
+    if g("arrival"):  lines.append(f"📅 <b>Дата прибытия:</b> {html.escape(g('arrival'))}")
+    if g("applicant"):lines.append(f"👤 <b>Заявитель:</b> {html.escape(g('applicant'))}")
+    if g("comment"):  lines.append(f"📝 <b>Комментарий:</b> {html.escape(g('comment'))}")
+    return "\n".join(lines)
 
 def build_keyboard(comment: str, status: str, order_id: str) -> Optional[Dict]:
     """
-    Кнопки в СТОЛБЕЦ (каждая на своей строке):
-      – если СТАТУС = 'доставлено в тк' → '📦 ТМЦ ПОЛУЧЕНО'
-      – если КОММЕНТАРИЙ содержит 'требуется согласование' → три кнопки ниже, каждая на своей строке
+    Вертикальные кнопки:
+      - если в комментарии есть "ТРЕБУЕТСЯ СОГЛАСОВАНИЕ" → кнопки Согласовано / На доработку / Отклонено
+      - если статус "Доставлено в ТК" → кнопка "ТМЦ ПОЛУЧЕНО"
     """
-    rows = []
+    c = (comment or "").lower()
+    s = (status or "").lower()
 
-    # 1) По статусу — кнопка получения ТМЦ (одна строка)
-    if _is_delivered_to_tk(status):
-        rows.append([{"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}])
-
-    # 2) По комментарию — набор согласования (каждая кнопка на отдельной строке)
-    c = _norm(comment)
     if "требуется согласование" in c:
-        rows.append([{"text": "✅ В РАБОТУ",      "callback_data": f"approve|{order_id}"}])
-        rows.append([{"text": "🔧 НА ДОРАБОТКУ",  "callback_data": f"revise|{order_id}"}])
-        rows.append([{"text": "❌ ОТКЛОНЕНО",     "callback_data": f"reject|{order_id}"}])
+        return {
+            "inline_keyboard": [
+                [{"text": "✅ В РАБОТУ: СОГЛАСОВАНО", "callback_data": f"approve|{order_id}"}],
+                [{"text": "🔧 НА ДОРАБОТКУ",           "callback_data": f"revise|{order_id}"}],
+                [{"text": "❌ ОТКЛОНЕНО",              "callback_data": f"reject|{order_id}"}],
+            ]
+        }
 
-    return {"inline_keyboard": rows} if rows else None
+    if "доставлено в тк" in s:
+        return {
+            "inline_keyboard": [
+                [{"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}]
+            ]
+        }
 
-
-def render_message(data: Dict[str, Any]) -> str:
-    g = lambda k: html.escape(str(data.get(k) or ""))
-    parts = [
-        "📦 <b>Уведомление о заявке</b>",
-        f"🧾 <b>Заявка:</b> {g('order_id')}",
-        f"⭐ <b>Статус:</b> {g('status')}",
-    ]
-    if data.get("priority"):
-        parts.append(f"🏷 <b>Приоритет:</b> {g('priority')}")
-    if data.get("applicant"):
-        parts.append(f"👤 <b>Заявитель:</b> {g('applicant')}")
-    if data.get("comment"):
-        parts.append(f"📝 <b>Комментарий:</b> {g('comment')}")
-    return "\n".join(parts)
+    return None
 
 
-# ======= /notify (из Google Apps Script) =======
+# ======== Роуты ========
+@app.get("/")
+def root():
+    return {"ok": True, "routes": ["/", "/health", "/notify", "/tg (GET/POST)", "/docs"]}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "snab-bot", "webhook": "/tg", "notify": "/notify"}
 
 @app.post("/notify")
 async def notify(req: Request, authorization: Optional[str] = Header(None)):
-    if authorization != f"Bearer {WEBHOOK_SECRET}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Авторизация от Apps Script (Bearer WEBHOOK_SECRET)
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token = authorization.split("Bearer ", 1)[-1].strip()
+    if token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     data = await req.json()
-    order_id = data.get("order_id", "")
-    comment  = data.get("comment", "")
-    status   = data.get("status", "")
+    text = format_order_text(data)
+    kb = build_keyboard(
+        comment=data.get("comment", ""),
+        status=data.get("status", ""),
+        order_id=data.get("order_id", "")
+    )
 
-    # соберём текст и клавиатуру
-    msg = render_message(data)
-    keyboard = build_keyboard(comment, status, order_id)
-
-    Thread(target=lambda: tg_send_message(msg, reply_markup=keyboard)).start()
+    # отправляем в чат
+    Thread(target=lambda: tg_send_message(text, reply_markup=kb)).start()
     return {"ok": True}
-
-
-# ======= /tg — обработчик нажатий =======
 
 @app.post("/tg")
 async def tg_webhook(req: Request):
     update = await req.json()
     print("TG update:", update)
 
+    # Нажатие на inline-кнопку
     if "callback_query" in update:
         cq = update["callback_query"]
-        data = cq.get("data", "")
+        cb_id = cq.get("id")
+        data  = cq.get("data", "")
+        msg   = cq.get("message", {})
+        chat  = msg.get("chat", {})
+        chat_id = chat.get("id")
+        message_id = msg.get("message_id")
         user = cq.get("from", {})
-        user_id = user.get("id")
-        first_name = user.get("first_name", "")
-        last_name = user.get("last_name", "")
-        user_name = (first_name + " " + last_name).strip() or f"ID:{user_id}"
-        chat_id = cq["message"]["chat"]["id"]
+        user_name = user_display_name(user)
 
-        parts = data.split("|", 1)
-        if len(parts) != 2:
+        try:
+            action, order_id = data.split("|", 1)
+        except ValueError:
+            tg_answer_callback_query(cb_id, "Некорректные данные")
             return {"ok": False}
 
-        action, order_id = parts
+        # отключаем кнопки у исходного сообщения
+        if chat_id and message_id:
+            tg_edit_reply_markup(chat_id, message_id)
 
-        # ✅ В РАБОТУ
         if action == "approve":
             new_status = "В РАБОТУ: СОГЛАСОВАНО"
-            msg = f"✅ Заявка <b>{order_id}</b> согласована и принята в работу.\n👤 Исполнитель: <b>{html.escape(user_name)}</b>"
             update_sheet_status(order_id, new_status)
-            tg_send_message(msg)
+            tg_answer_callback_query(cb_id, "Согласовано ✅")
+            tg_send_message(f"✅ Заявка <b>{html.escape(order_id)}</b> согласована.\n👤 Исполнитель: <b>{html.escape(user_name)}</b>")
 
-        # ❌ ОТКЛОНЕНО
         elif action == "reject":
             new_status = "ОТКЛОНЕНО"
-            msg = f"❌ Заявка <b>{order_id}</b> отклонена.\n👤 Исполнитель: <b>{html.escape(user_name)}</b>"
             update_sheet_status(order_id, new_status)
-            tg_send_message(msg)
+            tg_answer_callback_query(cb_id, "Отклонено ❌")
+            tg_send_message(f"❌ Заявка <b>{html.escape(order_id)}</b> отклонена.\n👤 Решение: <b>{html.escape(user_name)}</b>")
 
-        # 🔧 НА ДОРАБОТКУ
         elif action == "revise":
-            pending_comments[user_id] = order_id
+            # ждём текст следующим сообщением от нажавшего
+            pending_comments[user.get("id")] = order_id
+            tg_answer_callback_query(cb_id, "Укажите доработки 🔧")
             tg_send_message(
-                f"🔧 Для заявки <b>{order_id}</b> требуется уточнение.\n"
-                f"Пожалуйста, ответьте сюда сообщением — ваш комментарий будет добавлен в таблицу.\n"
-                f"👤 Исполнитель: <b>{html.escape(user_name)}</b>"
+                f"🔧 Для заявки <b>{html.escape(order_id)}</b> требуется доработка.\n"
+                f"👤 <b>{html.escape(user_name)}</b>, ответьте сюда текстом — он попадёт в комментарий."
             )
 
-        # 📦 ТМЦ ПОЛУЧЕНО
         elif action == "received":
-            new_status = "ТМЦ ПОЛУЧЕНО"
-            msg = f"📦 Заявка <b>{order_id}</b> отмечена как полученная.\n👤 Ответственный: <b>{html.escape(user_name)}</b>"
+            # в таблицу пишем ровно «Доставлено»
+            new_status = "Доставлено"
             update_sheet_status(order_id, new_status)
-            tg_send_message(msg)
+            tg_answer_callback_query(cb_id, "ТМЦ получено 📦")
+            tg_send_message(
+                f"📦 ТМЦ по заявке <b>{html.escape(order_id)}</b> получено.\n"
+                f"📋 Статус в таблице: <b>{new_status}</b>\n"
+                f"👤 Отметил: <b>{html.escape(user_name)}</b>"
+            )
 
+        else:
+            tg_answer_callback_query(cb_id, "Неизвестное действие")
         return {"ok": True}
 
-    # === пользователь отвечает сообщением (доработка) ===
+    # Ответ текстом для "На доработку"
     if "message" in update:
         msg = update["message"]
         user = msg.get("from", {})
-        user_id = user.get("id")
-        text = msg.get("text", "").strip()
-        first_name = user.get("first_name", "")
-        last_name = user.get("last_name", "")
-        user_name = (first_name + " " + last_name).strip() or f"ID:{user_id}"
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return {"ok": True}
 
-        if user_id in pending_comments:
-            order_id = pending_comments.pop(user_id)
-            new_status = f"На доработку: {text}"
-            update_sheet_status(order_id, new_status)
+        uid = user.get("id")
+        if uid in pending_comments:
+            order_id = pending_comments.pop(uid)
+            new_status = "На доработку"
+            update_sheet_status(order_id, new_status, comment=text)
             tg_send_message(
-                f"🔧 Заявка <b>{order_id}</b> отправлена на доработку с комментарием:\n"
-                f"{html.escape(text)}\n👤 Исполнитель: <b>{html.escape(user_name)}</b>"
+                f"🔧 Заявка <b>{html.escape(order_id)}</b> отправлена на доработку.\n"
+                f"💬 Комментарий: {html.escape(text)}\n"
+                f"👤 От: <b>{html.escape(user_display_name(user))}</b>"
             )
-
         return {"ok": True}
 
-    return {"ok": False}
-    # === пользователь отвечает сообщением (доработка) ===
-    if "message" in update:
-        msg = update["message"]
-        user = msg.get("from", {})
-        user_id = user.get("id")
-        text = msg.get("text", "").strip()
-
-        if user_id in pending_comments:
-            order_id = pending_comments.pop(user_id)
-            # фиксируем комментарий в статусе — можно сменить на отдельную запись в колонку Комментарий,
-            # если в Apps Script сделана соответствующая обработка
-            new_status = f"На доработку: {text}"
-            update_sheet_status(order_id, new_status)
-            tg_send_message(
-                f"🔧 Заявка <b>{order_id}</b> отправлена на доработку с комментарием:\n{text}"
-            )
-
-        return {"ok": True}
-
-    return {"ok": False}
-
-
-# ======= HEALTH =======
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    return {"ok": True}
