@@ -4,7 +4,7 @@ import html
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, Header, HTTPException
 
-app = FastAPI(title="SnabOrders Bot", version="2.4")
+app = FastAPI(title="SnabOrders Bot", version="2.5")
 
 # ===== ENV =====
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
@@ -18,7 +18,23 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # user_id -> order_id  (для режима «НА ДОРАБОТКУ»)
 PENDING_REVISE: Dict[int, str] = {}
 
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+
+def get_str(data: Dict[str, Any], key: str) -> str:
+    """Безопасно достаём поле как строку."""
+    v = data.get(key)
+    if v is None:
+        return ""
+    try:
+        return str(v).strip()
+    except Exception:
+        return ""
+
+def norm(s: str) -> str:
+    return str(s or "").lower().replace("\u00a0", " ").strip()
+
 # ---------- TG УТИЛИТЫ ----------
+
 def tg_send_message(text: str, reply_markup: Optional[Dict]=None, parse_mode: str="HTML"):
     if not BOT_TOKEN or not CHAT_ID:
         print("TG: missing BOT_TOKEN/CHAT_ID")
@@ -87,6 +103,7 @@ def fmt_user(u: Dict[str, Any]) -> str:
     return html.escape(full) if full else f"id:{u.get('id')}"
 
 # ---------- SHEET УТИЛИТЫ ----------
+
 def sheet_update_status(order_id: str, new_status: str, comment: Optional[str]=None):
     if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
         print("SHEET: missing SHEET_SCRIPT_URL/SHEET_API_KEY")
@@ -110,38 +127,47 @@ def sheet_update_status(order_id: str, new_status: str, comment: Optional[str]=N
         print("sheet_update_status error:", e)
         return {"ok": False, "error": str(e)}
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
-def norm(s: str) -> str:
-    return (s or "").lower().replace("\u00a0", " ").strip()
+# ---------- ТЕКСТ СООБЩЕНИЯ ----------
 
 def make_message(data: Dict[str, Any]) -> str:
-    get = lambda k: (data.get(k) or "").strip()
+    order_id  = get_str(data, "order_id")
+    priority  = get_str(data, "priority")
+    status    = get_str(data, "status")
+    carrier   = get_str(data, "carrier")
+    ttn       = get_str(data, "ttn")
+    ship_date = get_str(data, "ship_date")
+    arrival   = get_str(data, "arrival")
+    applicant = get_str(data, "applicant")
+    comment   = get_str(data, "comment")
+    invoice   = get_str(data, "invoice")  # <- безопасно, даже если число/формула
+
     lines = ["📦 <b>Уведомление о заявке</b>"]
 
-    if get("order_id"):
-        lines.append(f"🧾 <b>Заявка:</b> {get('order_id')}")
-    if get("priority"):
-        lines.append(f"⭐ <b>Приоритет:</b> {get('priority')}")
-    if get("status"):
-        lines.append(f"🚚 <b>Статус:</b> {get('status')}")
-    if get("carrier"):
-        lines.append(f"🚛 <b>ТК:</b> {get('carrier')}")
-    if get("ttn"):
-        lines.append(f"📄 <b>№ ТТН:</b> {get('ttn')}")
-    if get("ship_date"):
-        lines.append(f"📅 <b>Дата отгрузки:</b> {get('ship_date')}")
-    if get("arrival"):
-        lines.append(f"📅 <b>Дата прибытия:</b> {get('arrival')}")
-    if get("applicant"):
-        lines.append(f"👤 <b>Заявитель:</b> {get('applicant')}")
-    if get("comment"):
-        lines.append(f"📝 <b>Комментарий:</b> {get('comment')}")
-
-    # Счёт/КП: кнопку рисуем в клавиатуре, тут можем просто упомянуть
-    if get("invoice"):
+    if order_id:
+        lines.append(f"🧾 <b>Заявка:</b> {html.escape(order_id)}")
+    if priority:
+        lines.append(f"⭐ <b>Приоритет:</b> {html.escape(priority)}")
+    if status:
+        lines.append(f"🚚 <b>Статус:</b> {html.escape(status)}")
+    if carrier:
+        lines.append(f"🚛 <b>ТК:</b> {html.escape(carrier)}")
+    if ttn:
+        lines.append(f"📄 <b>№ ТТН:</b> {html.escape(ttn)}")
+    if ship_date:
+        lines.append(f"📅 <b>Дата отгрузки:</b> {html.escape(ship_date)}")
+    if arrival:
+        lines.append(f"📅 <b>Дата прибытия:</b> {html.escape(arrival)}")
+    if applicant:
+        lines.append(f"👤 <b>Заявитель:</b> {html.escape(applicant)}")
+    if comment:
+        lines.append(f"📝 <b>Комментарий:</b> {html.escape(comment)}")
+    if invoice:
+        # саму ссылку не показываем, только подпись — кнопка будет в клавиатуре
         lines.append("📄 <b>Счёт/КП:</b> доступен по кнопке ниже")
 
     return "\n".join(lines)
+
+# ---------- КЛАВИАТУРА ----------
 
 def build_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
     """
@@ -151,19 +177,20 @@ def build_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
       – если есть invoice → кнопка 📄 Открыть счёт (url)
     """
     rows = []
-    st = norm(data.get("status", ""))
-    cm = norm(data.get("comment", ""))
-    order_id = (data.get("order_id") or "").strip()
-    invoice = (data.get("invoice") or "").strip()
+
+    order_id = get_str(data, "order_id")
+    status   = norm(get_str(data, "status"))
+    comment  = norm(get_str(data, "comment"))
+    invoice  = get_str(data, "invoice")
 
     # Кнопка "ТМЦ ПОЛУЧЕНО" при статусе "доставлено в тк"
-    if order_id and "доставлено в тк" in st:
+    if order_id and "доставлено в тк" in status:
         rows.append([
             {"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}
         ])
 
     # Кнопки согласования при "ТРЕБУЕТСЯ СОГЛАСОВАНИЕ" в комментарии
-    if order_id and "требуется согласование" in cm:
+    if order_id and "требуется согласование" in comment:
         rows.append([
             {"text": "✅ В РАБОТУ", "callback_data": f"approve|{order_id}"}
         ])
@@ -185,6 +212,7 @@ def build_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
     return {"inline_keyboard": rows}
 
 # ---------- ROUTES ----------
+
 @app.get("/")
 def root():
     return {"ok": True, "routes": ["/", "/health", "/notify", "/tg"]}
@@ -198,7 +226,10 @@ def health():
 async def notify(req: Request, authorization: Optional[str] = Header(None)):
     if authorization != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     data = await req.json()
+    print("NOTIFY data:", data)
+
     text = make_message(data)
     kb   = build_keyboard(data)
     tg_send_message(text, reply_markup=kb)
@@ -286,7 +317,6 @@ async def tg_webhook(req: Request):
         if uid in PENDING_REVISE and text:
             order_id = PENDING_REVISE.pop(uid)
             sheet_update_status(order_id, "На доработку", comment=text)
-            # В чат ничего нового не шлём, только обновляем таблицу
         return {"ok": True}
 
     return {"ok": True}
