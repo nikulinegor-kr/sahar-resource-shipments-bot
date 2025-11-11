@@ -4,7 +4,7 @@ import html
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, Header, HTTPException
 
-app = FastAPI(title="SnabOrders Bot", version="2.5")
+app = FastAPI(title="SnabOrders Bot", version="2.6")
 
 # ===== ENV =====
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
@@ -21,7 +21,7 @@ PENDING_REVISE: Dict[int, str] = {}
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 
 def get_str(data: Dict[str, Any], key: str) -> str:
-    """Безопасно достаём поле как строку."""
+    """Безопасно достаём поле как строку (чтобы не падало из-за типов)."""
     v = data.get(key)
     if v is None:
         return ""
@@ -139,7 +139,7 @@ def make_message(data: Dict[str, Any]) -> str:
     arrival   = get_str(data, "arrival")
     applicant = get_str(data, "applicant")
     comment   = get_str(data, "comment")
-    invoice   = get_str(data, "invoice")  # <- безопасно, даже если число/формула
+    invoice   = get_str(data, "invoice")  # поле «Счёт/КП»
 
     lines = ["📦 <b>Уведомление о заявке</b>"]
 
@@ -162,7 +162,7 @@ def make_message(data: Dict[str, Any]) -> str:
     if comment:
         lines.append(f"📝 <b>Комментарий:</b> {html.escape(comment)}")
     if invoice:
-        # саму ссылку не показываем, только подпись — кнопка будет в клавиатуре
+        # саму ссылку не светим, только подпись — кнопка будет ниже
         lines.append("📄 <b>Счёт/КП:</b> доступен по кнопке ниже")
 
     return "\n".join(lines)
