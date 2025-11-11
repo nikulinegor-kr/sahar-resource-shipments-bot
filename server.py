@@ -4,7 +4,7 @@ import html
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, Header, HTTPException
 
-app = FastAPI(title="SnabOrders Bot", version="2.6")
+app = FastAPI(title="SnabOrders Bot", version="2.7")
 
 # ===== ENV =====
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
@@ -139,7 +139,7 @@ def make_message(data: Dict[str, Any]) -> str:
     arrival   = get_str(data, "arrival")
     applicant = get_str(data, "applicant")
     comment   = get_str(data, "comment")
-    invoice   = get_str(data, "invoice")  # поле «Счёт/КП»
+    invoice   = get_str(data, "invoice")  # поле «Счёт/КП» (URL)
 
     lines = ["📦 <b>Уведомление о заявке</b>"]
 
@@ -162,7 +162,6 @@ def make_message(data: Dict[str, Any]) -> str:
     if comment:
         lines.append(f"📝 <b>Комментарий:</b> {html.escape(comment)}")
     if invoice:
-        # саму ссылку не светим, только подпись — кнопка будет ниже
         lines.append("📄 <b>Счёт/КП:</b> доступен по кнопке ниже")
 
     return "\n".join(lines)
@@ -170,12 +169,6 @@ def make_message(data: Dict[str, Any]) -> str:
 # ---------- КЛАВИАТУРА ----------
 
 def build_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
-    """
-    Собираем одну общую клавиатуру:
-      – при статусе «доставлено в тк» → кнопка ТМЦ ПОЛУЧЕНО
-      – при комментарии «требуется согласование» → В РАБОТУ / НА ДОРАБОТКУ / ОТКЛОНЕНО
-      – если есть invoice → кнопка 📄 Открыть счёт (url)
-    """
     rows = []
 
     order_id = get_str(data, "order_id")
@@ -191,18 +184,12 @@ def build_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
 
     # Кнопки согласования при "ТРЕБУЕТСЯ СОГЛАСОВАНИЕ" в комментарии
     if order_id and "требуется согласование" in comment:
-        rows.append([
-            {"text": "✅ В РАБОТУ", "callback_data": f"approve|{order_id}"}
-        ])
-        rows.append([
-            {"text": "🔧 НА ДОРАБОТКУ", "callback_data": f"revise|{order_id}"}
-        ])
-        rows.append([
-            {"text": "❌ ОТКЛОНЕНО", "callback_data": f"reject|{order_id}"}
-        ])
+        rows.append([{"text": "✅ В РАБОТУ",     "callback_data": f"approve|{order_id}"}])
+        rows.append([{"text": "🔧 НА ДОРАБОТКУ", "callback_data": f"revise|{order_id}"}])
+        rows.append([{"text": "❌ ОТКЛОНЕНО",    "callback_data": f"reject|{order_id}"}])
 
-    # Кнопка "Открыть счёт" (url) — если в таблице есть ссылка
-    if invoice:
+    # Кнопка "Открыть счёт" (url) — только если это нормальная ссылка
+    if invoice and (invoice.startswith("http://") or invoice.startswith("https://")):
         rows.append([
             {"text": "📄 Открыть счёт", "url": invoice}
         ])
@@ -253,7 +240,6 @@ async def tg_webhook(req: Request):
         parts     = data_raw.split("|", 1)
         who       = fmt_user(user)
 
-        # защита от "noop" и пустого
         if data_raw in ("", "noop"):
             tg_answer_callback_query(cq_id, "Уже отмечено ✅")
             return {"ok": True}
@@ -265,7 +251,6 @@ async def tg_webhook(req: Request):
         action, order_id = parts[0], parts[1]
 
         try:
-            # убираем клавиатуру
             tg_edit_reply_markup(chat_id=chat["id"], message_id=mid, reply_markup=None)
 
             if action == "received":
