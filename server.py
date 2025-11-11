@@ -4,7 +4,7 @@ import html
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, Header, HTTPException
 
-app = FastAPI(title="SnabOrders Bot", version="2.3")
+app = FastAPI(title="SnabOrders Bot", version="2.4")
 
 # ===== ENV =====
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
@@ -39,10 +39,15 @@ def tg_send_message(text: str, reply_markup: Optional[Dict]=None, parse_mode: st
 
 def tg_edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict]):
     try:
-        r = requests.post(f"{TG_API}/editMessageReplyMarkup",
-                          json={"chat_id": chat_id, "message_id": message_id,
-                                "reply_markup": reply_markup},
-                          timeout=10)
+        r = requests.post(
+            f"{TG_API}/editMessageReplyMarkup",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": reply_markup,
+            },
+            timeout=10,
+        )
         print("tg_edit_reply_markup:", r.status_code, r.text[:200])
     except Exception as e:
         print("tg_edit_reply_markup error:", e)
@@ -50,15 +55,17 @@ def tg_edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[D
 def tg_edit_message_text(chat_id: int, message_id: int, new_text: str, parse_mode: str="HTML"):
     """Редактируем текст исходного сообщения (без нового поста в чат)."""
     try:
-        r = requests.post(f"{TG_API}/editMessageText",
-                          json={
-                              "chat_id": chat_id,
-                              "message_id": message_id,
-                              "text": new_text,
-                              "parse_mode": parse_mode,
-                              "disable_web_page_preview": True
-                          },
-                          timeout=10)
+        r = requests.post(
+            f"{TG_API}/editMessageText",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": new_text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
         print("tg_edit_message_text:", r.status_code, r.text[:200])
     except Exception as e:
         print("tg_edit_message_text error:", e)
@@ -88,16 +95,25 @@ def sheet_update_status(order_id: str, new_status: str, comment: Optional[str]=N
     if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
         print("SHEET: missing SHEET_SCRIPT_URL/SHEET_API_KEY")
         return {"ok": False, "error": "config"}
-    payload = {"action": "update_status", "order_id": order_id, "new_status": new_status}
+    payload = {
+        "action": "update_status",
+        "order_id": order_id,
+        "new_status": new_status,
+    }
     if comment is not None:
         payload["comment"] = comment
         payload["action"] = "status_with_comment"
     try:
-        r = requests.post(SHEET_SCRIPT_URL,
-                          headers={"Authorization": f"Bearer {SHEET_API_KEY}"},
-                          json=payload, timeout=12)
+        r = requests.post(
+            SHEET_SCRIPT_URL,
+            headers={"Authorization": f"Bearer {SHEET_API_KEY}"},
+            json=payload,
+            timeout=12,
+        )
         print("sheet_update_status:", r.status_code, r.text[:200])
-        return r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": r.ok}
+        if r.headers.get("content-type", "").startswith("application/json"):
+            return r.json()
+        return {"ok": r.ok}
     except Exception as e:
         print("sheet_update_status error:", e)
         return {"ok": False, "error": str(e)}
@@ -105,7 +121,11 @@ def sheet_update_status(order_id: str, new_status: str, comment: Optional[str]=N
 # ---------- КЛАВИАТУРЫ ----------
 def kb_delivered(order_id: str) -> Dict:
     # одна кнопка в отдельной строке (вертикально)
-    return {"inline_keyboard": [[{"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}]]}
+    return {
+        "inline_keyboard": [
+            [{"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}],
+        ]
+    }
 
 def kb_approval(order_id: str) -> Dict:
     # вертикально: по одной кнопке в строке
@@ -123,38 +143,45 @@ def norm(s: str) -> str:
 # ---------- ТЕКСТЫ ----------
 def make_message(data: Dict[str, Any]) -> str:
     get = lambda k: (data.get(k) or "").strip()
+
     lines = ["📦 <b>Уведомление о заявке</b>"]
     if get("order_id"):
-        lines.append(f"🧾 <b>Заявка:</b> {get('order_id')}")
+        lines.append(f"🧾 <b>Заявка:</b> {html.escape(get('order_id'))}")
     if get("priority"):
-        lines.append(f"⭐ <b>Приоритет:</b> {get('priority')}")
+        lines.append(f"⭐ <b>Приоритет:</b> {html.escape(get('priority'))}")
     if get("status"):
-        lines.append(f"🚚 <b>Статус:</b> {get('status')}")
+        lines.append(f"🚚 <b>Статус:</b> {html.escape(get('status'))}")
     if get("carrier"):
-        lines.append(f"🚛 <b>ТК:</b> {get('carrier')}")
+        lines.append(f"🚛 <b>ТК:</b> {html.escape(get('carrier'))}")
     if get("ttn"):
-        lines.append(f"📄 <b>№ ТТН:</b> {get('ttn')}")
+        lines.append(f"📄 <b>№ ТТН:</b> {html.escape(get('ttn'))}")
     if get("ship_date"):
-        lines.append(f"📅 <b>Дата отгрузки:</b> {get('ship_date')}")
+        lines.append(f"📅 <b>Дата отгрузки:</b> {html.escape(get('ship_date'))}")
     if get("arrival"):
-        lines.append(f"📅 <b>Дата прибытия:</b> {get('arrival')}")
+        lines.append(f"📅 <b>Дата прибытия:</b> {html.escape(get('arrival'))}")
     if get("applicant"):
-        lines.append(f"👤 <b>Заявитель:</b> {get('applicant')}")
+        lines.append(f"👤 <b>Заявитель:</b> {html.escape(get('applicant'))}")
     if get("comment"):
-        lines.append(f"📝 <b>Комментарий:</b> {get('comment')}")
-    if get("invoice"):
-        lines.append(f"📄 <b>Счёт/КП:</b> {get('invoice')}")  # 🔹 НОВАЯ СТРОКА
+        lines.append(f"📝 <b>Комментарий:</b> {html.escape(get('comment'))}")
+
+    # 🔹 АККУРАТНЫЙ ВЫВОД СЧЁТА / КП
+    invoice_url = (data.get("invoice") or "").strip()
+    if invoice_url:
+        # минимально экранируем кавычки в URL, чтобы не сломать тег <a>
+        safe_url = invoice_url.replace('"', "%22")
+        lines.append(f'📄 <b>Счёт/КП:</b> <a href="{safe_url}">Открыть счёт</a>')
+
     return "\n".join(lines)
 
 def pick_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
-    st = norm(data.get("status",""))
-    cm = norm(data.get("comment",""))
+    st = norm(data.get("status", ""))
+    cm = norm(data.get("comment", ""))
     # кнопка "получено" — при статусе «доставлено в тк»
     if "доставлено в тк" in st:
-        return kb_delivered(data.get("order_id",""))
+        return kb_delivered(data.get("order_id", ""))
     # согласование — если в комментарии «требуется согласование»
     if "требуется согласование" in cm:
-        return kb_approval(data.get("order_id",""))
+        return kb_approval(data.get("order_id", ""))
     return None
 
 # ---------- ROUTES ----------
@@ -171,6 +198,7 @@ def health():
 async def notify(req: Request, authorization: Optional[str] = Header(None)):
     if authorization != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     data = await req.json()
     text = make_message(data)
     kb   = pick_keyboard(data)
@@ -211,13 +239,10 @@ async def tg_webhook(req: Request):
             tg_edit_reply_markup(chat_id=chat["id"], message_id=mid, reply_markup=None)
 
             if action == "received":
-                # статус в таблице
                 sheet_update_status(order_id, "Доставлено")
-                # обновляем текст сообщения: добавляем «кто нажал»
                 footer = f"\n\n📌 <i>ТМЦ получено — отметил: {who}</i>"
                 new_text = (orig_text or "").rstrip() + footer
                 tg_edit_message_text(chat_id=chat["id"], message_id=mid, new_text=new_text)
-                # короткий тост только для нажавшего
                 tg_answer_callback_query(cq_id, "Отмечено как получено 📦")
                 return {"ok": True}
 
