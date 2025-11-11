@@ -41,12 +41,8 @@ def tg_edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[D
     try:
         r = requests.post(
             f"{TG_API}/editMessageReplyMarkup",
-            json={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "reply_markup": reply_markup,
-            },
-            timeout=10,
+            json={"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup},
+            timeout=10
         )
         print("tg_edit_reply_markup:", r.status_code, r.text[:200])
     except Exception as e:
@@ -62,9 +58,9 @@ def tg_edit_message_text(chat_id: int, message_id: int, new_text: str, parse_mod
                 "message_id": message_id,
                 "text": new_text,
                 "parse_mode": parse_mode,
-                "disable_web_page_preview": True,
+                "disable_web_page_preview": True
             },
-            timeout=10,
+            timeout=10
         )
         print("tg_edit_message_text:", r.status_code, r.text[:200])
     except Exception as e:
@@ -95,11 +91,7 @@ def sheet_update_status(order_id: str, new_status: str, comment: Optional[str]=N
     if not SHEET_SCRIPT_URL or not SHEET_API_KEY:
         print("SHEET: missing SHEET_SCRIPT_URL/SHEET_API_KEY")
         return {"ok": False, "error": "config"}
-    payload = {
-        "action": "update_status",
-        "order_id": order_id,
-        "new_status": new_status,
-    }
+    payload = {"action": "update_status", "order_id": order_id, "new_status": new_status}
     if comment is not None:
         payload["comment"] = comment
         payload["action"] = "status_with_comment"
@@ -108,7 +100,7 @@ def sheet_update_status(order_id: str, new_status: str, comment: Optional[str]=N
             SHEET_SCRIPT_URL,
             headers={"Authorization": f"Bearer {SHEET_API_KEY}"},
             json=payload,
-            timeout=12,
+            timeout=12
         )
         print("sheet_update_status:", r.status_code, r.text[:200])
         if r.headers.get("content-type", "").startswith("application/json"):
@@ -118,71 +110,79 @@ def sheet_update_status(order_id: str, new_status: str, comment: Optional[str]=N
         print("sheet_update_status error:", e)
         return {"ok": False, "error": str(e)}
 
-# ---------- КЛАВИАТУРЫ ----------
-def kb_delivered(order_id: str) -> Dict:
-    # одна кнопка в отдельной строке (вертикально)
-    return {
-        "inline_keyboard": [
-            [{"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}],
-        ]
-    }
-
-def kb_approval(order_id: str) -> Dict:
-    # вертикально: по одной кнопке в строке
-    return {
-        "inline_keyboard": [
-            [{"text": "✅ В РАБОТУ",     "callback_data": f"approve|{order_id}"}],
-            [{"text": "🔧 НА ДОРАБОТКУ", "callback_data": f"revise|{order_id}"}],
-            [{"text": "❌ ОТКЛОНЕНО",    "callback_data": f"reject|{order_id}"}],
-        ]
-    }
-
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 def norm(s: str) -> str:
     return (s or "").lower().replace("\u00a0", " ").strip()
 
-# ---------- ТЕКСТЫ ----------
 def make_message(data: Dict[str, Any]) -> str:
     get = lambda k: (data.get(k) or "").strip()
-
     lines = ["📦 <b>Уведомление о заявке</b>"]
-    if get("order_id"):
-        lines.append(f"🧾 <b>Заявка:</b> {html.escape(get('order_id'))}")
-    if get("priority"):
-        lines.append(f"⭐ <b>Приоритет:</b> {html.escape(get('priority'))}")
-    if get("status"):
-        lines.append(f"🚚 <b>Статус:</b> {html.escape(get('status'))}")
-    if get("carrier"):
-        lines.append(f"🚛 <b>ТК:</b> {html.escape(get('carrier'))}")
-    if get("ttn"):
-        lines.append(f"📄 <b>№ ТТН:</b> {html.escape(get('ttn'))}")
-    if get("ship_date"):
-        lines.append(f"📅 <b>Дата отгрузки:</b> {html.escape(get('ship_date'))}")
-    if get("arrival"):
-        lines.append(f"📅 <b>Дата прибытия:</b> {html.escape(get('arrival'))}")
-    if get("applicant"):
-        lines.append(f"👤 <b>Заявитель:</b> {html.escape(get('applicant'))}")
-    if get("comment"):
-        lines.append(f"📝 <b>Комментарий:</b> {html.escape(get('comment'))}")
 
-    # 🔹 АККУРАТНЫЙ ВЫВОД СЧЁТА / КП
-    invoice_url = (data.get("invoice") or "").strip()
-    if invoice_url:
-        # минимально экранируем кавычки в URL, чтобы не сломать тег <a>
-        safe_url = invoice_url.replace('"', "%22")
-        lines.append(f'📄 <b>Счёт/КП:</b> <a href="{safe_url}">Открыть счёт</a>')
+    if get("order_id"):
+        lines.append(f"🧾 <b>Заявка:</b> {get('order_id')}")
+    if get("priority"):
+        lines.append(f"⭐ <b>Приоритет:</b> {get('priority')}")
+    if get("status"):
+        lines.append(f"🚚 <b>Статус:</b> {get('status')}")
+    if get("carrier"):
+        lines.append(f"🚛 <b>ТК:</b> {get('carrier')}")
+    if get("ttn"):
+        lines.append(f"📄 <b>№ ТТН:</b> {get('ttn')}")
+    if get("ship_date"):
+        lines.append(f"📅 <b>Дата отгрузки:</b> {get('ship_date')}")
+    if get("arrival"):
+        lines.append(f"📅 <b>Дата прибытия:</b> {get('arrival')}")
+    if get("applicant"):
+        lines.append(f"👤 <b>Заявитель:</b> {get('applicant')}")
+    if get("comment"):
+        lines.append(f"📝 <b>Комментарий:</b> {get('comment')}")
+
+    # Счёт/КП: кнопку рисуем в клавиатуре, тут можем просто упомянуть
+    if get("invoice"):
+        lines.append("📄 <b>Счёт/КП:</b> доступен по кнопке ниже")
 
     return "\n".join(lines)
 
-def pick_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
+def build_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
+    """
+    Собираем одну общую клавиатуру:
+      – при статусе «доставлено в тк» → кнопка ТМЦ ПОЛУЧЕНО
+      – при комментарии «требуется согласование» → В РАБОТУ / НА ДОРАБОТКУ / ОТКЛОНЕНО
+      – если есть invoice → кнопка 📄 Открыть счёт (url)
+    """
+    rows = []
     st = norm(data.get("status", ""))
     cm = norm(data.get("comment", ""))
-    # кнопка "получено" — при статусе «доставлено в тк»
-    if "доставлено в тк" in st:
-        return kb_delivered(data.get("order_id", ""))
-    # согласование — если в комментарии «требуется согласование»
-    if "требуется согласование" in cm:
-        return kb_approval(data.get("order_id", ""))
-    return None
+    order_id = (data.get("order_id") or "").strip()
+    invoice = (data.get("invoice") or "").strip()
+
+    # Кнопка "ТМЦ ПОЛУЧЕНО" при статусе "доставлено в тк"
+    if order_id and "доставлено в тк" in st:
+        rows.append([
+            {"text": "📦 ТМЦ ПОЛУЧЕНО", "callback_data": f"received|{order_id}"}
+        ])
+
+    # Кнопки согласования при "ТРЕБУЕТСЯ СОГЛАСОВАНИЕ" в комментарии
+    if order_id and "требуется согласование" in cm:
+        rows.append([
+            {"text": "✅ В РАБОТУ", "callback_data": f"approve|{order_id}"}
+        ])
+        rows.append([
+            {"text": "🔧 НА ДОРАБОТКУ", "callback_data": f"revise|{order_id}"}
+        ])
+        rows.append([
+            {"text": "❌ ОТКЛОНЕНО", "callback_data": f"reject|{order_id}"}
+        ])
+
+    # Кнопка "Открыть счёт" (url) — если в таблице есть ссылка
+    if invoice:
+        rows.append([
+            {"text": "📄 Открыть счёт", "url": invoice}
+        ])
+
+    if not rows:
+        return None
+    return {"inline_keyboard": rows}
 
 # ---------- ROUTES ----------
 @app.get("/")
@@ -198,10 +198,9 @@ def health():
 async def notify(req: Request, authorization: Optional[str] = Header(None)):
     if authorization != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     data = await req.json()
     text = make_message(data)
-    kb   = pick_keyboard(data)
+    kb   = build_keyboard(data)
     tg_send_message(text, reply_markup=kb)
     return {"ok": True}
 
@@ -223,7 +222,7 @@ async def tg_webhook(req: Request):
         parts     = data_raw.split("|", 1)
         who       = fmt_user(user)
 
-        # защита от «заблокированных»/пустых нажатий
+        # защита от "noop" и пустого
         if data_raw in ("", "noop"):
             tg_answer_callback_query(cq_id, "Уже отмечено ✅")
             return {"ok": True}
@@ -235,14 +234,14 @@ async def tg_webhook(req: Request):
         action, order_id = parts[0], parts[1]
 
         try:
-            # сразу убираем клавиатуру
+            # убираем клавиатуру
             tg_edit_reply_markup(chat_id=chat["id"], message_id=mid, reply_markup=None)
 
             if action == "received":
                 sheet_update_status(order_id, "Доставлено")
                 footer = f"\n\n📌 <i>ТМЦ получено — отметил: {who}</i>"
                 new_text = (orig_text or "").rstrip() + footer
-                tg_edit_message_text(chat_id=chat["id"], message_id=mid, new_text=new_text)
+                tg_edit_message_text(chat["id"], mid, new_text)
                 tg_answer_callback_query(cq_id, "Отмечено как получено 📦")
                 return {"ok": True}
 
@@ -250,7 +249,7 @@ async def tg_webhook(req: Request):
                 sheet_update_status(order_id, "В РАБОТУ: СОГЛАСОВАНО")
                 footer = f"\n\n📌 <i>В РАБОТУ — подтвердил: {who}</i>"
                 new_text = (orig_text or "").rstrip() + footer
-                tg_edit_message_text(chat_id=chat["id"], message_id=mid, new_text=new_text)
+                tg_edit_message_text(chat["id"], mid, new_text)
                 tg_answer_callback_query(cq_id, "Отмечено: В РАБОТУ ✅")
                 return {"ok": True}
 
@@ -258,16 +257,15 @@ async def tg_webhook(req: Request):
                 sheet_update_status(order_id, "ОТКЛОНЕНО")
                 footer = f"\n\n📌 <i>ОТКЛОНЕНО — отметил: {who}</i>"
                 new_text = (orig_text or "").rstrip() + footer
-                tg_edit_message_text(chat_id=chat["id"], message_id=mid, new_text=new_text)
+                tg_edit_message_text(chat["id"], mid, new_text)
                 tg_answer_callback_query(cq_id, "Отмечено: ОТКЛОНЕНО")
                 return {"ok": True}
 
             elif action == "revise":
-                # ждём следующее текстовое сообщение от нажавшего
                 PENDING_REVISE[user.get("id")] = order_id
                 footer = f"\n\n📌 <i>НА ДОРАБОТКУ — ждём комментарий от: {who}</i>"
                 new_text = (orig_text or "").rstrip() + footer
-                tg_edit_message_text(chat_id=chat["id"], message_id=mid, new_text=new_text)
+                tg_edit_message_text(chat["id"], mid, new_text)
                 tg_answer_callback_query(cq_id, "Пришлите одним сообщением комментарий 🔧")
                 return {"ok": True}
 
@@ -288,7 +286,7 @@ async def tg_webhook(req: Request):
         if uid in PENDING_REVISE and text:
             order_id = PENDING_REVISE.pop(uid)
             sheet_update_status(order_id, "На доработку", comment=text)
-            # В чат ничего не дописываем — только обновили таблицу
+            # В чат ничего нового не шлём, только обновляем таблицу
         return {"ok": True}
 
     return {"ok": True}
