@@ -124,15 +124,26 @@ def norm(s: str) -> str:
 def make_message(data: Dict[str, Any]) -> str:
     get = lambda k: (data.get(k) or "").strip()
     lines = ["📦 <b>Уведомление о заявке</b>"]
-    if get("order_id"):   lines.append(f"🧾 <b>Заявка:</b> {html.escape(get('order_id'))}")
-    if get("priority"):   lines.append(f"⭐ <b>Приоритет:</b> {html.escape(get('priority'))}")
-    if get("status"):     lines.append(f"🚚 <b>Статус:</b> {html.escape(get('status'))}")
-    if get("carrier"):    lines.append(f"🚛 <b>ТК:</b> {html.escape(get('carrier'))}")
-    if get("ttn"):        lines.append(f"📄 <b>№ ТТН:</b> {html.escape(get('ttn'))}")
-    if get("ship_date"):  lines.append(f"📅 <b>Дата отгрузки:</b> {html.escape(get('ship_date'))}")
-    if get("arrival"):    lines.append(f"📅 <b>Дата прибытия:</b> {html.escape(get('arrival'))}")
-    if get("applicant"):  lines.append(f"👤 <b>Заявитель:</b> {html.escape(get('applicant'))}")
-    if get("comment"):    lines.append(f"📝 <b>Комментарий:</b> {html.escape(get('comment'))}")
+    if get("order_id"):
+        lines.append(f"🧾 <b>Заявка:</b> {get('order_id')}")
+    if get("priority"):
+        lines.append(f"⭐ <b>Приоритет:</b> {get('priority')}")
+    if get("status"):
+        lines.append(f"🚚 <b>Статус:</b> {get('status')}")
+    if get("carrier"):
+        lines.append(f"🚛 <b>ТК:</b> {get('carrier')}")
+    if get("ttn"):
+        lines.append(f"📄 <b>№ ТТН:</b> {get('ttn')}")
+    if get("ship_date"):
+        lines.append(f"📅 <b>Дата отгрузки:</b> {get('ship_date')}")
+    if get("arrival"):
+        lines.append(f"📅 <b>Дата прибытия:</b> {get('arrival')}")
+    if get("applicant"):
+        lines.append(f"👤 <b>Заявитель:</b> {get('applicant')}")
+    if get("comment"):
+        lines.append(f"📝 <b>Комментарий:</b> {get('comment')}")
+    if get("invoice"):
+        lines.append(f"📄 <b>Счёт/КП:</b> {get('invoice')}")  # 🔹 НОВАЯ СТРОКА
     return "\n".join(lines)
 
 def pick_keyboard(data: Dict[str, Any]) -> Optional[Dict]:
